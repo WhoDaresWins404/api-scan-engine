@@ -55,4 +55,4 @@ _None yet._
 - 2026-05-27 11:32  [test]  session-001 skeleton committed
 
 ## Next session goal
-_Update this section before committing at session end._
+Build the mitmproxy integration (proxy/core/proxy.py) — the addon that bridges live traffic into the IModule/IStore system. Then wire EndpointMapper to it and verify it captures real browser traffic.
