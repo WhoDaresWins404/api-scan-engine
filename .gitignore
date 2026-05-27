@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Project runtime files
+journal.jsonl
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
