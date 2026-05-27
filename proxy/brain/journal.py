@@ -4,7 +4,7 @@
 # No dependencies outside the standard library.
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -24,7 +24,7 @@ class Journal:
 
     def log(self, event_type: str, detail: str, data: dict | None = None) -> None:
         entry = {
-            "ts": datetime.utcnow().isoformat(),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "event": event_type,
             "detail": detail,
             "data": data or {},

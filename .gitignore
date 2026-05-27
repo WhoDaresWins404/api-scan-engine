@@ -11,3 +11,4 @@ journal.jsonl
 # OS
 .DS_Store
 Thumbs.db
+scan_engine.db

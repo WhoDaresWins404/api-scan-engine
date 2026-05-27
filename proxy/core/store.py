@@ -9,7 +9,7 @@ import json
 import sqlite3
 import uuid
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -69,7 +69,7 @@ class SQLiteStore(IStore):
     async def write(self, collection: str, record: dict) -> str:
         record_id = record.get("id") or str(uuid.uuid4())
         record["id"] = record_id
-        record.setdefault("created_at", datetime.utcnow().isoformat())
+        record.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
         self._conn.execute(
             "INSERT OR REPLACE INTO records (id, collection, data, created_at) "
@@ -106,8 +106,11 @@ class SQLiteStore(IStore):
         self._subscribers[event_type].append(callback)
 
     async def publish(self, event_type: str, payload: dict) -> None:
-        for callback in self._subscribers.get(event_type, []):
-            if asyncio.iscoroutinefunction(callback):
-                await callback(payload)
-            else:
-                callback(payload)
+            for callback in self._subscribers.get(event_type, []):
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(payload)
+                    else:
+                        callback(payload)
+                except Exception:
+                    pass  # subscribers must never crash the publisher
