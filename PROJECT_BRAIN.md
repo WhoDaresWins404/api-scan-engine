@@ -1,5 +1,5 @@
 # PROJECT_BRAIN — API Scan Engine
-_Auto-generated: 2026-05-28 — Session 002_
+_Auto-generated: 2026-05-28 21:33 UTC_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
@@ -8,7 +8,7 @@ _Paste this file at the start of every new session._
 - Store: SQLite (Phase 1) → PostgreSQL (Phase 2), IStore abstraction
 - Protocols: HTTP/HTTPS (Phase 1) → GraphQL/WS (Phase 2) → gRPC (Phase 3)
 - Delta patch workflow: git apply / python apply.py for all code changes
-- Lab environment: WSL2/Ubuntu inside Windows, VS Code WSL extension
+- Lab environment: VirtualBox Ubuntu VM (192.168.50.221), VS Code Remote-SSH
 
 ## Core interfaces (proxy/core/interfaces.py)
 - ProxyRequest: id, timestamp, method, url, headers, body
@@ -23,80 +23,76 @@ proxy/
   core/
     interfaces.py       # IModule, IStore, shared dataclasses
     store.py            # SQLiteStore — concrete IStore implementation
-    proxy.py            # ★ NEW — ScanAddon (mitmproxy addon)
-    runner.py           # ★ NEW — CLI launcher (python -m proxy.core.runner)
+    proxy.py            # ScanAddon (mitmproxy addon)
+    runner.py           # CLI launcher — wires store, journal, generator
   modules/
     endpoint_mapper.py  # discovers unique host+path+method combinations (v0.2.0)
   brain/
-    generator.py        # generates this file from live store
-    journal.py          # append-only session event log
-apply.py                # patch helper (git apply wrapper)
+    generator.py        # regenerates this file — every 10 min + on shutdown
+    journal.py          # append-only session event log (scan.journal.jsonl)
+conftest.py             # pytest sys.path fix
+pyproject.toml          # packaging + pytest config (asyncio_mode=auto)
 patches/                # numbered .patch files from each session
-  0001-session-002-mitmproxy-integration-tests.patch
 tests/
-  test_proxy.py         # ★ NEW — 15 tests for ScanAddon pipeline
-
-## Key design decisions made this session
-- ScanAddon stores ProxyRequest in `flow.metadata["scan_request"]` so the
-  response hook can retrieve the exact same object without re-parsing
-- Module calls are wrapped in `_timed()` — a per-call asyncio.wait_for so one
-  slow/broken module never blocks the proxy
-- `asyncio.gather(*tasks, return_exceptions=True)` used so all modules run
-  concurrently; exceptions are caught and logged, not propagated
-- Health sweep runs as a background asyncio Task every 60 s, started in
-  `ScanAddon.running()` (mitmproxy lifecycle hook)
-- runner.py is both a CLI entry point (`python -m proxy.core.runner`) and an
-  importable async function (`await run_proxy(...)`) for test/embed use
-
-## How to run the proxy (WSL2)
-```bash
-# Install (once)
-pip install mitmproxy pytest pytest-asyncio
-
-# Run tests
-cd /path/to/project
-pytest tests/test_proxy.py -v
-
-# Start proxy (port 8080, SQLite at scan.db)
-python -m proxy.core.runner --port 8080 --db scan.db --log-level DEBUG
-
-# Configure browser to use 127.0.0.1:8080 as HTTP proxy
-# Trust mitmproxy CA: browse to http://mitm.it and install cert
-```
+  test_proxy.py         # 16 tests, all passing
 
 ## Current state
 - [x] Project skeleton — interfaces, store, journal, apply helper
 - [x] SQLiteStore — write, read, query, pub/sub verified
-- [x] EndpointMapper module — verified (v0.2.0, now emits Finding on discovery)
-- [x] BrainGenerator — auto-generates this file
+- [x] EndpointMapper module — verified (v0.2.0, emits Finding on discovery)
+- [x] BrainGenerator — every 10 min + on shutdown, wired to runner.py
+- [x] Journal — wired to runner.py start/stop events
 - [x] mitmproxy integration — proxy/core/proxy.py + runner.py complete
-- [x] 15 tests covering: request/response hooks, slow/broken module tolerance,
-      findings persistence, pub/sub, EndpointMapper deduplication + method splitting
+- [x] 16 tests passing (pytest tests/ -v), 0 warnings
+- [x] VirtualBox VM deployment — 192.168.50.221, DHCP reserved lease
+- [x] CA cert distributed — TLS interception working subnet-wide
 - [ ] PassiveScanner module — not started
 - [ ] FindingReporter module — not started
-- [ ] Live browser smoke test — needs real WSL2 environment
 
-## Discovered endpoints
-- POST https://api.example.com/users  [None]
-- GET https://api.example.com/users  [200]
+## Discovered endpoints (15 total)
+- GET http://detectportal.firefox.com/canonical.html   [last status: 200]
+- GET http://detectportal.firefox.com/success.txt   [last status: 200]
+- POST https://play.google.com/log   [last status: 200]
+- GET https://search.brave.com/api/suggest   [last status: 422]
+- GET https://www.google.com/   [last status: 200]
+- POST https://www.google.com/adview   [last status: 204]
+- GET https://www.google.com/async/hpba   [last status: 200]
+- GET https://www.google.com/complete/s   [last status: 200]
+- GET https://www.google.com/gen_204   [last status: 204]
+- POST https://www.google.com/gen_204   [last status: 204]
+- GET https://www.google.com/xjs/_/js/k=xjs.hd.de.j8s5Z0dD-o0.2019.O/ck=xjs.hd.2om9GWu2klQ.L.B1.O/am=AAACAgAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAiBAAAYAAAIgAAAAAEAgQEAAAAEAAAAAAAQeoAAQAMAAAAAAAAAAAAAAAAEAgQQAAAQAAAAAAAACBAAABAAQAAAgBAAAABgAAABAAEkEACABgUAAAAAAAIAAAAAAAAAABABAAAAhAAAfxhgDQAAAAAAgCERBgMBAAAAAMKABQAAAAUAAACAAAgAAAAAAAAISAACACBgAEAAAAAEAAAAAAACAgghCAACFEAAAAAQAAAQAAAAABQIEBAAAAAACACAAEBAIAQQAAAAgIACBAABAIIABAQAjKABAEhUCAAAQgcAACAAAAAAAAEAAAAAAAAAAAAAAJwAAAQEAAAgAWAIBAIABAAAAAA6AAIPMKSgAAAAAAAAAAAAAAAAAAAAAAAAAAEUwC4kUBAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAQGhTAAAAAACAxQ/d=0/dg=0/br=1/ujg=1/rs=ACT90oFscYaC8gLxuNuusCOeBUgZ1Uk4hQ/m=syxi,HGv0mf,sy1pi,syi4,sysc,VtMfj,U9EYge,sy11q,loL8vb,sy11t,sy11s,sy108,sy107,syzz,sy102,sy10w,sy10t,sy10r,sydb,sydc,syd6,sy10u,sy10z,sygv,sygu,sygt,sy10v,sy10x,sy110,sy111,sy10y,sy106,sy10f,sy10b,sy10a,sy109,syzw,sy10q,sy10h,sy10m,sy10i,sy10e,sy10d,sy10c,syzy,syzt,syym,sy100,ms4mZb,syx8,B2qlPe,sy140,NzU6V,sy14i,sy9b,WlNQGd,syzs,syzq,syzp,DPreE,sy14k,sy14j,nabPbb,abd,sy44q,TDFkye   [last status: 200]
+- GET https://www.google.com/xjs/_/ss/k=xjs.hd.2om9GWu2klQ.L.B1.O/am=AAACAgAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAiBAAAYAAAAAAAAAAEAAAEAAAAEAAAAAAAQegAAQAMAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAAACBAAABAAAAAAgBAAAAAAAAABAAEkAACAAAUAAAAAAAIAAAAAAAAAAAABAAAAAAAAAAAACQAAAAAAgAEQBgMBAAAAAMIAAAAAAAAAAAAAAAAAAAAAAAAISAACACBgAAAAAAAEAAAAAAACAgghCAACFEAAAAAAAAAQAAAAABQIEBAAAAAAAACAAEBAIAQQAAAAgAAABAABAAIABAQAjKABAEhUCAAAQgcAACAAAAAAAAEAAAAAAAAAAAAAAIwAAAAAAAAgAWAIBAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUA/d=0/br=1/rs=ACT90oFEnt4LbuAMQTrTvjVt_DcqHyV_lg/m=aG3wVc,syr0,sysu,syrg,synt,sy146   [last status: 200]
+- GET https://www.google.com/xjs/_/ss/k=xjs.hd.2om9GWu2klQ.L.B1.O/am=AAACAgAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAiBAAAYAAAAAAAAAAEAAAEAAAAEAAAAAAAQegAAQAMAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAAACBAAABAAAAAAgBAAAAAAAAABAAEkAACAAAUAAAAAAAIAAAAAAAAAAAABAAAAAAAAAAAACQAAAAAAgAEQBgMBAAAAAMIAAAAAAAAAAAAAAAAAAAAAAAAISAACACBgAAAAAAAEAAAAAAACAgghCAACFEAAAAAAAAAQAAAAABQIEBAAAAAAAACAAEBAIAQQAAAAgAAABAABAAIABAQAjKABAEhUCAAAQgcAACAAAAAAAAEAAAAAAAAAAAAAAIwAAAAAAAAgAWAIBAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUA/d=0/br=1/rs=ACT90oFEnt4LbuAMQTrTvjVt_DcqHyV_lg/m=syx7,sy1pk,sym5,sypb   [last status: 200]
+- GET https://www.google.com/xjs/_/ss/k=xjs.hd.2om9GWu2klQ.L.B1.O/am=AAACAgAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAiBAAAYAAAAAAAAAAEAAAEAAAAEAAAAAAAQegAAQAMAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAAACBAAABAAAAAAgBAAAAAAAAABAAEkAACAAAUAAAAAAAIAAAAAAAAAAAABAAAAAAAAAAAACQAAAAAAgAEQBgMBAAAAAMIAAAAAAAAAAAAAAAAAAAAAAAAISAACACBgAAAAAAAEAAAAAAACAgghCAACFEAAAAAAAAAQAAAAABQIEBAAAAAAAACAAEBAIAQQAAAAgAAABAABAAIABAQAjKABAEhUCAAAQgcAACAAAAAAAAEAAAAAAAAAAAAAAIwAAAAAAAAgAWAIBAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUA/d=0/br=1/rs=ACT90oFEnt4LbuAMQTrTvjVt_DcqHyV_lg/m=y05UD,PPhKqf,vECdaf,sy1jj,sy151,sy1kq,sy1km,sy1n1,sy153,sy152,sy154,sy14y,syo5,syrj,sy1n2,sy14w,sy14v,sy14x,epYOx   [last status: 200]
+- GET https://www.google.com/xjs/_/ss/k=xjs.hd.2om9GWu2klQ.L.B1.O/am=AAACAgAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAiBAAAYAAAAAAAAAAEAAAEAAAAEAAAAAAAQegAAQAMAAAAAAAAAAAAAAAAAAAQAAAAQAAAAAAAACBAAABAAAAAAgBAAAAAAAAABAAEkAACAAAUAAAAAAAIAAAAAAAAAAAABAAAAAAAAAAAACQAAAAAAgAEQBgMBAAAAAMIAAAAAAAAAAAAAAAAAAAAAAAAISAACACBgAAAAAAAEAAAAAAACAgghCAACFEAAAAAAAAAQAAAAABQIEBAAAAAAAACAAEBAIAQQAAAAgAAABAABAAIABAQAjKABAEhUCAAAQgcAACAAAAAAAAEAAAAAAAAAAAAAAIwAAAAAAAAgAWAIBAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUA/d=1/ed=1/br=1/rs=ACT90oFEnt4LbuAMQTrTvjVt_DcqHyV_lg/m=cdos,hsm,jsa,mb4ZUb,cEt90b,SNUn3,qddgKe,sTsDMc,dtl0hd,eHDfl,YV5bee,d,csi   [last status: 200]
 
-## Findings
-_None yet (from real traffic)._
+## Findings (15 total)
+- [INFO] New endpoint discovered — endpoint_mapper (request 115b7b48…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 7bef2f64…)
+- [INFO] New endpoint discovered — endpoint_mapper (request e7d03a69…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 12d7bccd…)
+- [INFO] New endpoint discovered — endpoint_mapper (request a620c521…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 83493816…)
+- [INFO] New endpoint discovered — endpoint_mapper (request b3b7de8f…)
+- [INFO] New endpoint discovered — endpoint_mapper (request ee4212ae…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 85292b89…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 2a0dabd7…)
+- [INFO] New endpoint discovered — endpoint_mapper (request d9402cfb…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 9f8c6f07…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 5218b218…)
+- [INFO] New endpoint discovered — endpoint_mapper (request af16f351…)
+- [INFO] New endpoint discovered — endpoint_mapper (request 8fb53dc9…)
 
 ## Last session journal
-- 2026-05-27 11:32  [test]  session-001 skeleton committed
-- 2026-05-28 09:34  [proxy] session-002 mitmproxy integration committed (48915b3)
-  - proxy/core/proxy.py     ScanAddon — mitmproxy addon
-  - proxy/core/runner.py    CLI + library launcher
-  - proxy/modules/endpoint_mapper.py  v0.2.0 (emits Findings)
-  - tests/test_proxy.py     15 tests, all parse-verified
+- 2026-05-28 21:31  [proxy]  started on 0.0.0.0:8080
+- 2026-05-28 21:32  [proxy]  stopped — regenerating PROJECT_BRAIN.md
+- 2026-05-28 21:32  [proxy]  started on 0.0.0.0:8080
+- 2026-05-28 21:33  [proxy]  stopped — regenerating PROJECT_BRAIN.md
 
 ## Next session goal
-1. **Live smoke test** — start the proxy in WSL2, point a browser at it,
-   confirm EndpointMapper finds real endpoints and writes them to scan.db
-   (`SELECT * FROM endpoints;` in sqlite3).
-2. **PassiveScanner module** (proxy/modules/passive_scanner.py) — detect:
-   - Missing security headers (CSP, HSTS, X-Frame-Options)
-   - Unauthenticated endpoints (no Authorization header on sensitive paths)
-   - Sensitive data in URLs (tokens, passwords in query strings)
-3. Wire PassiveScanner into runner.py alongside EndpointMapper.
+- Implement PassiveScanner module (proxy/modules/passive_scanner.py)
+  Detections: missing security headers (CSP, HSTS, X-Frame-Options),
+  sensitive data in URLs (tokens/passwords in query strings),
+  unauthenticated endpoints on sensitive paths
+- Wire PassiveScanner into runner.py alongside EndpointMapper
+- Add tests/test_passive_scanner.py

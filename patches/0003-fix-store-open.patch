@@ -1,0 +1,33 @@
+From 644d484aec163cf0194cd924bbda1cdd45e255ae Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Thu, 28 May 2026 15:54:04 +0000
+Subject: [PATCH] session-003: call store.open() before proxy start, close() on
+ shutdown
+
+---
+ proxy/core/runner.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/proxy/core/runner.py b/proxy/core/runner.py
+index 35554ad..b5cee6e 100644
+--- a/proxy/core/runner.py
++++ b/proxy/core/runner.py
+@@ -60,6 +60,7 @@ async def run_proxy(
+     from proxy.modules.endpoint_mapper import EndpointMapper
+ 
+     store = SQLiteStore(db_path)
++    store.open()
+ 
+     modules = [
+         EndpointMapper(store),
+@@ -83,6 +84,7 @@ async def run_proxy(
+         log.info("Shutting down…")
+     finally:
+         master.shutdown()
++        store.close()
+ 
+ 
+ def _build_parser() -> argparse.ArgumentParser:
+-- 
+2.43.0
+
