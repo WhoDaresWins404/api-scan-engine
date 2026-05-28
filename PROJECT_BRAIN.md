@@ -1,5 +1,5 @@
 # PROJECT_BRAIN — API Scan Engine
-_Auto-generated: 2026-05-27 17:24 UTC_
+_Auto-generated: 2026-05-28 — Session 002_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
@@ -21,38 +21,82 @@ _Paste this file at the start of every new session._
 ## File structure
 proxy/
   core/
-    interfaces.py   # IModule, IStore, shared dataclasses
-    store.py        # SQLiteStore — concrete IStore implementation
+    interfaces.py       # IModule, IStore, shared dataclasses
+    store.py            # SQLiteStore — concrete IStore implementation
+    proxy.py            # ★ NEW — ScanAddon (mitmproxy addon)
+    runner.py           # ★ NEW — CLI launcher (python -m proxy.core.runner)
   modules/
-    endpoint_mapper.py  # discovers unique host+path+method combinations
+    endpoint_mapper.py  # discovers unique host+path+method combinations (v0.2.0)
   brain/
-    generator.py    # generates this file from live store
-    journal.py      # append-only session event log
-apply.py            # patch helper (git apply wrapper)
-patches/            # numbered .patch files from each session
-tests/              # test suite (pytest)
+    generator.py        # generates this file from live store
+    journal.py          # append-only session event log
+apply.py                # patch helper (git apply wrapper)
+patches/                # numbered .patch files from each session
+  0001-session-002-mitmproxy-integration-tests.patch
+tests/
+  test_proxy.py         # ★ NEW — 15 tests for ScanAddon pipeline
+
+## Key design decisions made this session
+- ScanAddon stores ProxyRequest in `flow.metadata["scan_request"]` so the
+  response hook can retrieve the exact same object without re-parsing
+- Module calls are wrapped in `_timed()` — a per-call asyncio.wait_for so one
+  slow/broken module never blocks the proxy
+- `asyncio.gather(*tasks, return_exceptions=True)` used so all modules run
+  concurrently; exceptions are caught and logged, not propagated
+- Health sweep runs as a background asyncio Task every 60 s, started in
+  `ScanAddon.running()` (mitmproxy lifecycle hook)
+- runner.py is both a CLI entry point (`python -m proxy.core.runner`) and an
+  importable async function (`await run_proxy(...)`) for test/embed use
+
+## How to run the proxy (WSL2)
+```bash
+# Install (once)
+pip install mitmproxy pytest pytest-asyncio
+
+# Run tests
+cd /path/to/project
+pytest tests/test_proxy.py -v
+
+# Start proxy (port 8080, SQLite at scan.db)
+python -m proxy.core.runner --port 8080 --db scan.db --log-level DEBUG
+
+# Configure browser to use 127.0.0.1:8080 as HTTP proxy
+# Trust mitmproxy CA: browse to http://mitm.it and install cert
+```
 
 ## Current state
 - [x] Project skeleton — interfaces, store, journal, apply helper
 - [x] SQLiteStore — write, read, query, pub/sub verified
-- [x] EndpointMapper module — verified
+- [x] EndpointMapper module — verified (v0.2.0, now emits Finding on discovery)
 - [x] BrainGenerator — auto-generates this file
+- [x] mitmproxy integration — proxy/core/proxy.py + runner.py complete
+- [x] 15 tests covering: request/response hooks, slow/broken module tolerance,
+      findings persistence, pub/sub, EndpointMapper deduplication + method splitting
 - [ ] PassiveScanner module — not started
-- [ ] mitmproxy integration (proxy core) — not started
 - [ ] FindingReporter module — not started
-
-Endpoints discovered: 2
-Findings logged: 0
+- [ ] Live browser smoke test — needs real WSL2 environment
 
 ## Discovered endpoints
 - POST https://api.example.com/users  [None]
 - GET https://api.example.com/users  [200]
 
 ## Findings
-_None yet._
+_None yet (from real traffic)._
 
 ## Last session journal
 - 2026-05-27 11:32  [test]  session-001 skeleton committed
+- 2026-05-28 09:34  [proxy] session-002 mitmproxy integration committed (48915b3)
+  - proxy/core/proxy.py     ScanAddon — mitmproxy addon
+  - proxy/core/runner.py    CLI + library launcher
+  - proxy/modules/endpoint_mapper.py  v0.2.0 (emits Findings)
+  - tests/test_proxy.py     15 tests, all parse-verified
 
 ## Next session goal
-Build the mitmproxy integration (proxy/core/proxy.py) — the addon that bridges live traffic into the IModule/IStore system. Then wire EndpointMapper to it and verify it captures real browser traffic.
+1. **Live smoke test** — start the proxy in WSL2, point a browser at it,
+   confirm EndpointMapper finds real endpoints and writes them to scan.db
+   (`SELECT * FROM endpoints;` in sqlite3).
+2. **PassiveScanner module** (proxy/modules/passive_scanner.py) — detect:
+   - Missing security headers (CSP, HSTS, X-Frame-Options)
+   - Unauthenticated endpoints (no Authorization header on sensitive paths)
+   - Sensitive data in URLs (tokens, passwords in query strings)
+3. Wire PassiveScanner into runner.py alongside EndpointMapper.

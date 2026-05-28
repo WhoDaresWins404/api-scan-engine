@@ -1,0 +1,1353 @@
+From 512c49c4c94602f72aa530fdcc025cce01315253 Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Thu, 28 May 2026 10:02:59 +0000
+Subject: [PATCH] session-002b: fix import path, asyncio_mode=auto, missing
+ __init__.py files
+
+---
+ PROJECT_BRAIN.md                              | 102 ++
+ conftest.py                                   |  16 +
+ ...sion-002-mitmproxy-integration-tests.patch | 984 ++++++++++++++++++
+ patches/0002-mitmproxy-integration.patch      |   0
+ proxy/__init__.py                             |   0
+ proxy/brain/__init__.py                       |   0
+ proxy/core/__init__.py                        |   0
+ proxy/modules/__init__.py                     |   0
+ pyproject.toml                                |  34 +
+ tests/__init__.py                             |   0
+ tests/test_proxy.py                           |  23 +-
+ 11 files changed, 1142 insertions(+), 17 deletions(-)
+ create mode 100644 PROJECT_BRAIN.md
+ create mode 100644 conftest.py
+ create mode 100644 patches/0001-session-002-mitmproxy-integration-tests.patch
+ create mode 100644 patches/0002-mitmproxy-integration.patch
+ create mode 100644 proxy/__init__.py
+ create mode 100644 proxy/brain/__init__.py
+ create mode 100644 proxy/core/__init__.py
+ create mode 100644 proxy/modules/__init__.py
+ create mode 100644 pyproject.toml
+ create mode 100644 tests/__init__.py
+
+diff --git a/PROJECT_BRAIN.md b/PROJECT_BRAIN.md
+new file mode 100644
+index 0000000..39862bc
+--- /dev/null
++++ b/PROJECT_BRAIN.md
+@@ -0,0 +1,102 @@
++# PROJECT_BRAIN — API Scan Engine
++_Auto-generated: 2026-05-28 — Session 002_
++_Paste this file at the start of every new session._
++
++## Architecture (immutable decisions)
++- Proxy core: mitmproxy (Phase 1) → asyncio+httpx (Phase 3)
++- Module model: in-process, IModule interface enforced
++- Store: SQLite (Phase 1) → PostgreSQL (Phase 2), IStore abstraction
++- Protocols: HTTP/HTTPS (Phase 1) → GraphQL/WS (Phase 2) → gRPC (Phase 3)
++- Delta patch workflow: git apply / python apply.py for all code changes
++- Lab environment: WSL2/Ubuntu inside Windows, VS Code WSL extension
++
++## Core interfaces (proxy/core/interfaces.py)
++- ProxyRequest: id, timestamp, method, url, headers, body
++- ProxyResponse: request_id, timestamp, status_code, headers, body
++- ModuleHealth: module_name, version, status, last_seen, detail
++- Finding: module_name, severity, title, description, request_id, evidence, timestamp
++- IModule: name, version, on_request(), on_response(), healthcheck()
++- IStore: write(), read(), query(), subscribe(), publish()
++
++## File structure
++proxy/
++  core/
++    interfaces.py       # IModule, IStore, shared dataclasses
++    store.py            # SQLiteStore — concrete IStore implementation
++    proxy.py            # ★ NEW — ScanAddon (mitmproxy addon)
++    runner.py           # ★ NEW — CLI launcher (python -m proxy.core.runner)
++  modules/
++    endpoint_mapper.py  # discovers unique host+path+method combinations (v0.2.0)
++  brain/
++    generator.py        # generates this file from live store
++    journal.py          # append-only session event log
++apply.py                # patch helper (git apply wrapper)
++patches/                # numbered .patch files from each session
++  0001-session-002-mitmproxy-integration-tests.patch
++tests/
++  test_proxy.py         # ★ NEW — 15 tests for ScanAddon pipeline
++
++## Key design decisions made this session
++- ScanAddon stores ProxyRequest in `flow.metadata["scan_request"]` so the
++  response hook can retrieve the exact same object without re-parsing
++- Module calls are wrapped in `_timed()` — a per-call asyncio.wait_for so one
++  slow/broken module never blocks the proxy
++- `asyncio.gather(*tasks, return_exceptions=True)` used so all modules run
++  concurrently; exceptions are caught and logged, not propagated
++- Health sweep runs as a background asyncio Task every 60 s, started in
++  `ScanAddon.running()` (mitmproxy lifecycle hook)
++- runner.py is both a CLI entry point (`python -m proxy.core.runner`) and an
++  importable async function (`await run_proxy(...)`) for test/embed use
++
++## How to run the proxy (WSL2)
++```bash
++# Install (once)
++pip install mitmproxy pytest pytest-asyncio
++
++# Run tests
++cd /path/to/project
++pytest tests/test_proxy.py -v
++
++# Start proxy (port 8080, SQLite at scan.db)
++python -m proxy.core.runner --port 8080 --db scan.db --log-level DEBUG
++
++# Configure browser to use 127.0.0.1:8080 as HTTP proxy
++# Trust mitmproxy CA: browse to http://mitm.it and install cert
++```
++
++## Current state
++- [x] Project skeleton — interfaces, store, journal, apply helper
++- [x] SQLiteStore — write, read, query, pub/sub verified
++- [x] EndpointMapper module — verified (v0.2.0, now emits Finding on discovery)
++- [x] BrainGenerator — auto-generates this file
++- [x] mitmproxy integration — proxy/core/proxy.py + runner.py complete
++- [x] 15 tests covering: request/response hooks, slow/broken module tolerance,
++      findings persistence, pub/sub, EndpointMapper deduplication + method splitting
++- [ ] PassiveScanner module — not started
++- [ ] FindingReporter module — not started
++- [ ] Live browser smoke test — needs real WSL2 environment
++
++## Discovered endpoints
++- POST https://api.example.com/users  [None]
++- GET https://api.example.com/users  [200]
++
++## Findings
++_None yet (from real traffic)._
++
++## Last session journal
++- 2026-05-27 11:32  [test]  session-001 skeleton committed
++- 2026-05-28 09:34  [proxy] session-002 mitmproxy integration committed (48915b3)
++  - proxy/core/proxy.py     ScanAddon — mitmproxy addon
++  - proxy/core/runner.py    CLI + library launcher
++  - proxy/modules/endpoint_mapper.py  v0.2.0 (emits Findings)
++  - tests/test_proxy.py     15 tests, all parse-verified
++
++## Next session goal
++1. **Live smoke test** — start the proxy in WSL2, point a browser at it,
++   confirm EndpointMapper finds real endpoints and writes them to scan.db
++   (`SELECT * FROM endpoints;` in sqlite3).
++2. **PassiveScanner module** (proxy/modules/passive_scanner.py) — detect:
++   - Missing security headers (CSP, HSTS, X-Frame-Options)
++   - Unauthenticated endpoints (no Authorization header on sensitive paths)
++   - Sensitive data in URLs (tokens, passwords in query strings)
++3. Wire PassiveScanner into runner.py alongside EndpointMapper.
+diff --git a/conftest.py b/conftest.py
+new file mode 100644
+index 0000000..83ea38c
+--- /dev/null
++++ b/conftest.py
+@@ -0,0 +1,16 @@
++"""
++conftest.py — project root
++──────────────────────────
++Ensures the project root is on sys.path so that `import proxy.*`
++works whether the package is installed (pip install -e .) or not.
++
++pytest discovers this file automatically before collecting any tests.
++"""
++import sys
++from pathlib import Path
++
++# Insert project root at position 0 so our 'proxy' package takes
++# precedence over any system package also named 'proxy'.
++ROOT = Path(__file__).parent.resolve()
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
+diff --git a/patches/0001-session-002-mitmproxy-integration-tests.patch b/patches/0001-session-002-mitmproxy-integration-tests.patch
+new file mode 100644
+index 0000000..52207c1
+--- /dev/null
++++ b/patches/0001-session-002-mitmproxy-integration-tests.patch
+@@ -0,0 +1,984 @@
++From 48915b32aa2bc1cb9451ccc9fd2fbbde53439fb2 Mon Sep 17 00:00:00 2001
++From: Dev <dev@example.com>
++Date: Thu, 28 May 2026 09:34:06 +0000
++Subject: [PATCH] session-002: mitmproxy integration + tests
++
++---
++ proxy/core/interfaces.py         |  63 +++++
++ proxy/core/proxy.py              | 225 ++++++++++++++++
++ proxy/core/runner.py             | 123 +++++++++
++ proxy/modules/endpoint_mapper.py |  90 +++++++
++ tests/test_proxy.py              | 432 +++++++++++++++++++++++++++++++
++ 5 files changed, 933 insertions(+)
++ create mode 100644 proxy/core/interfaces.py
++ create mode 100644 proxy/core/proxy.py
++ create mode 100644 proxy/core/runner.py
++ create mode 100644 proxy/modules/endpoint_mapper.py
++ create mode 100644 tests/test_proxy.py
++
++diff --git a/proxy/core/interfaces.py b/proxy/core/interfaces.py
++new file mode 100644
++index 0000000..b0cb7fd
++--- /dev/null
+++++ b/proxy/core/interfaces.py
++@@ -0,0 +1,63 @@
+++from __future__ import annotations
+++import uuid
+++from dataclasses import dataclass, field
+++from datetime import datetime
+++from typing import Any, Protocol, runtime_checkable
+++
+++
+++@dataclass
+++class ProxyRequest:
+++    id: str
+++    timestamp: datetime
+++    method: str
+++    url: str
+++    headers: dict[str, str]
+++    body: bytes | None = None
+++
+++
+++@dataclass
+++class ProxyResponse:
+++    request_id: str
+++    timestamp: datetime
+++    status_code: int
+++    headers: dict[str, str]
+++    body: bytes | None = None
+++
+++
+++@dataclass
+++class ModuleHealth:
+++    module_name: str
+++    version: str
+++    status: str          # "ok" | "degraded" | "error"
+++    last_seen: datetime
+++    detail: str = ""
+++
+++
+++@dataclass
+++class Finding:
+++    module_name: str
+++    severity: str        # "info" | "low" | "medium" | "high" | "critical"
+++    title: str
+++    description: str
+++    request_id: str
+++    evidence: dict[str, Any] = field(default_factory=dict)
+++    timestamp: datetime = field(default_factory=datetime.utcnow)
+++
+++
+++@runtime_checkable
+++class IModule(Protocol):
+++    name: str
+++    version: str
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]: ...
+++    async def on_response(self, req: ProxyRequest, resp: ProxyResponse) -> list[Finding]: ...
+++    async def healthcheck(self) -> ModuleHealth: ...
+++
+++
+++@runtime_checkable
+++class IStore(Protocol):
+++    async def write(self, table: str, record: dict[str, Any]) -> None: ...
+++    async def read(self, table: str, id: str) -> dict[str, Any] | None: ...
+++    async def query(self, table: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]: ...
+++    async def subscribe(self, topic: str, handler) -> None: ...
+++    async def publish(self, topic: str, payload: Any) -> None: ...
++diff --git a/proxy/core/proxy.py b/proxy/core/proxy.py
++new file mode 100644
++index 0000000..7fbd2a2
++--- /dev/null
+++++ b/proxy/core/proxy.py
++@@ -0,0 +1,225 @@
+++"""
+++proxy/core/proxy.py
+++────────────────────────────────────────────────────────────────────
+++ScanAddon — mitmproxy addon that feeds live HTTP(S) traffic through
+++every registered IModule and persists results via IStore.
+++
+++Design decisions
+++────────────────
+++* mitmproxy runs its own asyncio loop; we integrate by using
+++  mitmproxy's native async hooks (request / response / error).
+++* Each flow gets a stable ProxyRequest built once on `request` and
+++  stored in flow.metadata so the `response` hook can retrieve it
+++  without re-parsing.
+++* Module calls are fire-and-forget tasks so a slow module never
+++  blocks the proxy.  Findings are gathered via asyncio.gather with
+++  a per-module timeout (default 5 s).
+++* All findings are written to the store via IStore.write().
+++* Health of each module is checked on startup and every
+++  HEALTH_INTERVAL seconds thereafter.
+++"""
+++from __future__ import annotations
+++
+++import asyncio
+++import logging
+++import uuid
+++from datetime import datetime
+++from typing import Any
+++
+++from mitmproxy import http
+++from mitmproxy.options import Options
+++
+++from proxy.core.interfaces import (
+++    Finding,
+++    IModule,
+++    IStore,
+++    ProxyRequest,
+++    ProxyResponse,
+++)
+++
+++log = logging.getLogger("scan.proxy")
+++
+++# ── tunables ──────────────────────────────────────────────────────
+++MODULE_TIMEOUT = 5.0          # seconds before a module call is abandoned
+++HEALTH_INTERVAL = 60.0        # seconds between health sweeps
+++META_KEY = "scan_request"     # key in flow.metadata
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++class ScanAddon:
+++    """
+++    mitmproxy addon.  Instantiate with a list of IModule objects and
+++    an IStore implementation, then pass to mitmproxy's master.
+++
+++    Example
+++    ───────
+++        from proxy.core.proxy import ScanAddon
+++        from proxy.modules.endpoint_mapper import EndpointMapper
+++        from proxy.core.store import SQLiteStore
+++
+++        store   = SQLiteStore("scan.db")
+++        addon   = ScanAddon(modules=[EndpointMapper(store)], store=store)
+++    """
+++
+++    def __init__(self, modules: list[IModule], store: IStore) -> None:
+++        self.modules: list[IModule] = modules
+++        self.store: IStore = store
+++        self._health_task: asyncio.Task | None = None
+++
+++    # ── mitmproxy lifecycle ───────────────────────────────────────
+++
+++    def running(self) -> None:
+++        """Called by mitmproxy when the proxy is ready to accept connections."""
+++        log.info("ScanAddon running — %d module(s) loaded", len(self.modules))
+++        for mod in self.modules:
+++            log.info("  • %s v%s", mod.name, mod.version)
+++        # kick off background health polling
+++        loop = asyncio.get_event_loop()
+++        self._health_task = loop.create_task(self._health_loop())
+++
+++    def done(self) -> None:
+++        """Called by mitmproxy on shutdown."""
+++        if self._health_task:
+++            self._health_task.cancel()
+++        log.info("ScanAddon stopped")
+++
+++    # ── traffic hooks ─────────────────────────────────────────────
+++
+++    async def request(self, flow: http.HTTPFlow) -> None:
+++        """Intercept outbound request."""
+++        req = _flow_to_request(flow)
+++        flow.metadata[META_KEY] = req
+++
+++        findings = await self._run_modules_request(req)
+++        await self._persist_findings(findings)
+++
+++    async def response(self, flow: http.HTTPFlow) -> None:
+++        """Intercept inbound response."""
+++        req: ProxyRequest | None = flow.metadata.get(META_KEY)
+++        if req is None:
+++            # edge case: flow was created before addon was attached
+++            req = _flow_to_request(flow)
+++
+++        resp = _flow_to_response(req.id, flow)
+++
+++        findings = await self._run_modules_response(req, resp)
+++        await self._persist_findings(findings)
+++
+++    async def error(self, flow: http.HTTPFlow) -> None:
+++        """Log proxy-level errors (TLS failures, connection resets, …)."""
+++        req: ProxyRequest | None = flow.metadata.get(META_KEY)
+++        rid = req.id if req else "unknown"
+++        log.warning("flow error [request_id=%s]: %s", rid, flow.error)
+++
+++    # ── internal helpers ──────────────────────────────────────────
+++
+++    async def _run_modules_request(self, req: ProxyRequest) -> list[Finding]:
+++        tasks = [
+++            _timed(mod.on_request(req), MODULE_TIMEOUT, mod.name)
+++            for mod in self.modules
+++        ]
+++        results = await asyncio.gather(*tasks, return_exceptions=True)
+++        return _flatten(results)
+++
+++    async def _run_modules_response(
+++        self, req: ProxyRequest, resp: ProxyResponse
+++    ) -> list[Finding]:
+++        tasks = [
+++            _timed(mod.on_response(req, resp), MODULE_TIMEOUT, mod.name)
+++            for mod in self.modules
+++        ]
+++        results = await asyncio.gather(*tasks, return_exceptions=True)
+++        return _flatten(results)
+++
+++    async def _persist_findings(self, findings: list[Finding]) -> None:
+++        for f in findings:
+++            try:
+++                await self.store.write(
+++                    "findings",
+++                    {
+++                        "module_name": f.module_name,
+++                        "severity": f.severity,
+++                        "title": f.title,
+++                        "description": f.description,
+++                        "request_id": f.request_id,
+++                        "evidence": f.evidence,
+++                        "timestamp": f.timestamp.isoformat(),
+++                    },
+++                )
+++                await self.store.publish("findings", f)
+++            except Exception as exc:
+++                log.error("Failed to persist finding: %s", exc)
+++
+++    async def _health_loop(self) -> None:
+++        while True:
+++            await asyncio.sleep(HEALTH_INTERVAL)
+++            for mod in self.modules:
+++                try:
+++                    health = await asyncio.wait_for(
+++                        mod.healthcheck(), timeout=MODULE_TIMEOUT
+++                    )
+++                    await self.store.write(
+++                        "health",
+++                        {
+++                            "module_name": health.module_name,
+++                            "version": health.version,
+++                            "status": health.status,
+++                            "last_seen": health.last_seen.isoformat(),
+++                            "detail": health.detail,
+++                        },
+++                    )
+++                    log.debug(
+++                        "health [%s] %s — %s",
+++                        health.module_name,
+++                        health.status,
+++                        health.detail,
+++                    )
+++                except Exception as exc:
+++                    log.error("Healthcheck failed for %s: %s", mod.name, exc)
+++
+++
+++# ── flow conversion helpers ───────────────────────────────────────
+++
+++def _flow_to_request(flow: http.HTTPFlow) -> ProxyRequest:
+++    mf = flow.request
+++    return ProxyRequest(
+++        id=str(uuid.uuid4()),
+++        timestamp=datetime.utcnow(),
+++        method=mf.method,
+++        url=mf.pretty_url,
+++        headers=dict(mf.headers),
+++        body=mf.content or None,
+++    )
+++
+++
+++def _flow_to_response(request_id: str, flow: http.HTTPFlow) -> ProxyResponse:
+++    mresp = flow.response
+++    return ProxyResponse(
+++        request_id=request_id,
+++        timestamp=datetime.utcnow(),
+++        status_code=mresp.status_code,
+++        headers=dict(mresp.headers),
+++        body=mresp.content or None,
+++    )
+++
+++
+++# ── concurrency utilities ─────────────────────────────────────────
+++
+++async def _timed(coro, timeout: float, name: str):
+++    """Wrap a coroutine with a timeout; log and return [] on failure."""
+++    try:
+++        return await asyncio.wait_for(coro, timeout=timeout)
+++    except asyncio.TimeoutError:
+++        log.warning("Module %s timed out", name)
+++        return []
+++    except Exception as exc:
+++        log.error("Module %s raised: %s", name, exc)
+++        return []
+++
+++
+++def _flatten(results: list) -> list[Finding]:
+++    out: list[Finding] = []
+++    for r in results:
+++        if isinstance(r, list):
+++            out.extend(r)
+++    return out
++diff --git a/proxy/core/runner.py b/proxy/core/runner.py
++new file mode 100644
++index 0000000..35554ad
++--- /dev/null
+++++ b/proxy/core/runner.py
++@@ -0,0 +1,123 @@
+++"""
+++proxy/core/runner.py
+++────────────────────────────────────────────────────────────────────
+++Programmatic launcher for the scan proxy.
+++
+++Usage (CLI)
+++───────────
+++    python -m proxy.core.runner --host 127.0.0.1 --port 8080 --db scan.db
+++
+++Usage (library)
+++───────────────
+++    from proxy.core.runner import run_proxy
+++    from proxy.modules.endpoint_mapper import EndpointMapper
+++    from proxy.core.store import SQLiteStore
+++
+++    asyncio.run(
+++        run_proxy(
+++            host="127.0.0.1",
+++            port=8080,
+++            db_path="scan.db",
+++            extra_modules=[],
+++        )
+++    )
+++"""
+++from __future__ import annotations
+++
+++import argparse
+++import asyncio
+++import logging
+++import sys
+++from typing import Sequence
+++
+++from mitmproxy import options
+++from mitmproxy.tools.dump import DumpMaster
+++
+++from proxy.core.proxy import ScanAddon
+++
+++log = logging.getLogger("scan.runner")
+++
+++
+++async def run_proxy(
+++    host: str = "127.0.0.1",
+++    port: int = 8080,
+++    db_path: str = "scan.db",
+++    extra_modules: list = (),
+++    ssl_insecure: bool = False,
+++) -> None:
+++    """
+++    Boot mitmproxy with ScanAddon.
+++
+++    Parameters
+++    ----------
+++    host, port      : listen address for the proxy
+++    db_path         : path for SQLiteStore
+++    extra_modules   : additional IModule instances beyond the defaults
+++    ssl_insecure    : pass --ssl-insecure (useful for testing)
+++    """
+++    # Late import so callers that don't use SQLiteStore can skip it
+++    from proxy.core.store import SQLiteStore
+++    from proxy.modules.endpoint_mapper import EndpointMapper
+++
+++    store = SQLiteStore(db_path)
+++
+++    modules = [
+++        EndpointMapper(store),
+++        *extra_modules,
+++    ]
+++
+++    addon = ScanAddon(modules=modules, store=store)
+++
+++    opts = options.Options(
+++        listen_host=host,
+++        listen_port=port,
+++        ssl_insecure=ssl_insecure,
+++    )
+++    master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+++    master.addons.add(addon)
+++
+++    log.info("Starting proxy on %s:%d  (db=%s)", host, port, db_path)
+++    try:
+++        await master.run()
+++    except KeyboardInterrupt:
+++        log.info("Shutting down…")
+++    finally:
+++        master.shutdown()
+++
+++
+++def _build_parser() -> argparse.ArgumentParser:
+++    p = argparse.ArgumentParser(
+++        description="API Scan Engine — mitmproxy runner",
+++        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+++    )
+++    p.add_argument("--host", default="127.0.0.1", help="Listen host")
+++    p.add_argument("--port", type=int, default=8080, help="Listen port")
+++    p.add_argument("--db", default="scan.db", help="SQLite database path")
+++    p.add_argument(
+++        "--ssl-insecure",
+++        action="store_true",
+++        help="Disable upstream TLS verification",
+++    )
+++    p.add_argument(
+++        "--log-level",
+++        default="INFO",
+++        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+++    )
+++    return p
+++
+++
+++if __name__ == "__main__":
+++    args = _build_parser().parse_args()
+++    logging.basicConfig(
+++        level=args.log_level,
+++        format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
+++        datefmt="%H:%M:%S",
+++    )
+++    asyncio.run(
+++        run_proxy(
+++            host=args.host,
+++            port=args.port,
+++            db_path=args.db,
+++            ssl_insecure=args.ssl_insecure,
+++        )
+++    )
++diff --git a/proxy/modules/endpoint_mapper.py b/proxy/modules/endpoint_mapper.py
++new file mode 100644
++index 0000000..4fb6d50
++--- /dev/null
+++++ b/proxy/modules/endpoint_mapper.py
++@@ -0,0 +1,90 @@
+++"""
+++proxy/modules/endpoint_mapper.py
+++────────────────────────────────────────────────────────────────────
+++Discovers unique host + path + method combinations and stores them
+++as "endpoints" records in IStore.
+++
+++A Finding (severity=info) is emitted the first time each unique
+++endpoint is seen, so subscribers can react in real time.
+++"""
+++from __future__ import annotations
+++
+++from datetime import datetime
+++from urllib.parse import urlparse
+++
+++from proxy.core.interfaces import (
+++    Finding,
+++    IStore,
+++    ModuleHealth,
+++    ProxyRequest,
+++    ProxyResponse,
+++)
+++
+++
+++class EndpointMapper:
+++    name = "endpoint_mapper"
+++    version = "0.2.0"
+++
+++    def __init__(self, store: IStore) -> None:
+++        self._store = store
+++        self._seen: set[str] = set()   # in-memory dedup cache
+++
+++    # ── IModule ───────────────────────────────────────────────────
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        parsed = urlparse(req.url)
+++        key = f"{req.method}|{parsed.scheme}://{parsed.netloc}{parsed.path}"
+++
+++        if key in self._seen:
+++            return []
+++
+++        self._seen.add(key)
+++
+++        record = {
+++            "method": req.method,
+++            "scheme": parsed.scheme,
+++            "host": parsed.netloc,
+++            "path": parsed.path,
+++            "first_seen": req.timestamp.isoformat(),
+++            "last_status": None,
+++        }
+++        await self._store.write("endpoints", record)
+++
+++        finding = Finding(
+++            module_name=self.name,
+++            severity="info",
+++            title="New endpoint discovered",
+++            description=f"{req.method} {parsed.scheme}://{parsed.netloc}{parsed.path}",
+++            request_id=req.id,
+++            evidence=record,
+++        )
+++        await self._store.publish("endpoints", record)
+++        return [finding]
+++
+++    async def on_response(
+++        self, req: ProxyRequest, resp: ProxyResponse
+++    ) -> list[Finding]:
+++        # Update last_status for the endpoint (best-effort, no Finding emitted)
+++        parsed = urlparse(req.url)
+++        endpoints = await self._store.query(
+++            "endpoints",
+++            {
+++                "method": req.method,
+++                "host": parsed.netloc,
+++                "path": parsed.path,
+++            },
+++        )
+++        for ep in endpoints:
+++            ep["last_status"] = resp.status_code
+++            await self._store.write("endpoints", ep)
+++        return []
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        count = len(await self._store.query("endpoints"))
+++        return ModuleHealth(
+++            module_name=self.name,
+++            version=self.version,
+++            status="ok",
+++            last_seen=datetime.utcnow(),
+++            detail=f"{count} endpoint(s) discovered so far",
+++        )
++diff --git a/tests/test_proxy.py b/tests/test_proxy.py
++new file mode 100644
++index 0000000..602adc1
++--- /dev/null
+++++ b/tests/test_proxy.py
++@@ -0,0 +1,432 @@
+++"""
+++tests/test_proxy.py
+++────────────────────────────────────────────────────────────────────
+++Tests for proxy/core/proxy.py — the ScanAddon mitmproxy bridge.
+++
+++Strategy
+++────────
+++We never spin up a real mitmproxy instance.  Instead we:
+++
+++  1. Build minimal stubs for mitmproxy's http.HTTPFlow / HTTPRequest /
+++     HTTPResponse objects (only the attributes ScanAddon reads).
+++  2. Call ScanAddon.request() / .response() directly, as mitmproxy
+++     would.
+++  3. Assert the right calls land on our FakeStore / FakeModule.
+++
+++This makes the suite fast, dependency-free at test time (mitmproxy is
+++still imported since ScanAddon imports it, but no network is used),
+++and fully deterministic.
+++"""
+++from __future__ import annotations
+++
+++import asyncio
+++from dataclasses import dataclass, field
+++from datetime import datetime
+++from typing import Any
+++from unittest.mock import AsyncMock, MagicMock, patch
+++
+++import pytest
+++
+++from proxy.core.interfaces import (
+++    Finding,
+++    IModule,
+++    IStore,
+++    ModuleHealth,
+++    ProxyRequest,
+++    ProxyResponse,
+++)
+++from proxy.core.proxy import ScanAddon, _flatten, _timed
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  Fakes
+++# ─────────────────────────────────────────────────────────────────
+++
+++class FakeStore:
+++    """Minimal in-memory IStore."""
+++
+++    def __init__(self):
+++        self._tables: dict[str, list[dict]] = {}
+++        self._published: list[tuple[str, Any]] = []
+++        self._subscribers: dict[str, list] = {}
+++
+++    async def write(self, table: str, record: dict) -> None:
+++        self._tables.setdefault(table, []).append(record)
+++
+++    async def read(self, table: str, id: str) -> dict | None:
+++        for r in self._tables.get(table, []):
+++            if r.get("id") == id:
+++                return r
+++        return None
+++
+++    async def query(self, table: str, filters: dict | None = None) -> list[dict]:
+++        rows = self._tables.get(table, [])
+++        if not filters:
+++            return list(rows)
+++        return [r for r in rows if all(r.get(k) == v for k, v in filters.items())]
+++
+++    async def subscribe(self, topic: str, handler) -> None:
+++        self._subscribers.setdefault(topic, []).append(handler)
+++
+++    async def publish(self, topic: str, payload: Any) -> None:
+++        self._published.append((topic, payload))
+++        for h in self._subscribers.get(topic, []):
+++            await h(payload)
+++
+++
+++class NullModule:
+++    """Module that always returns no findings."""
+++    name = "null_module"
+++    version = "0.0.1"
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        return []
+++
+++    async def on_response(self, req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++        return []
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        return ModuleHealth(
+++            module_name=self.name, version=self.version,
+++            status="ok", last_seen=datetime.utcnow()
+++        )
+++
+++
+++class RecordingModule:
+++    """Module that records calls and returns a canned Finding on response."""
+++    name = "recording_module"
+++    version = "0.0.1"
+++
+++    def __init__(self):
+++        self.requests: list[ProxyRequest] = []
+++        self.responses: list[tuple[ProxyRequest, ProxyResponse]] = []
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        self.requests.append(req)
+++        return []
+++
+++    async def on_response(self, req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++        self.responses.append((req, resp))
+++        return [
+++            Finding(
+++                module_name=self.name,
+++                severity="info",
+++                title="Test finding",
+++                description="response observed",
+++                request_id=req.id,
+++            )
+++        ]
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        return ModuleHealth(
+++            module_name=self.name, version=self.version,
+++            status="ok", last_seen=datetime.utcnow()
+++        )
+++
+++
+++class SlowModule:
+++    """Module that always times out."""
+++    name = "slow_module"
+++    version = "0.0.1"
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        await asyncio.sleep(999)
+++        return []
+++
+++    async def on_response(self, req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++        await asyncio.sleep(999)
+++        return []
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        await asyncio.sleep(999)
+++
+++
+++class BrokenModule:
+++    """Module that always raises."""
+++    name = "broken_module"
+++    version = "0.0.1"
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        raise RuntimeError("boom")
+++
+++    async def on_response(self, req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++        raise RuntimeError("boom")
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        raise RuntimeError("boom")
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  mitmproxy flow stubs
+++# ─────────────────────────────────────────────────────────────────
+++
+++def _make_flow(
+++    method: str = "GET",
+++    url: str = "https://api.example.com/users",
+++    req_body: bytes = b"",
+++    status_code: int = 200,
+++    resp_body: bytes = b'{"ok":true}',
+++) -> MagicMock:
+++    """Build a minimal mitmproxy HTTPFlow stub."""
+++    flow = MagicMock()
+++    flow.metadata = {}
+++    flow.error = None
+++
+++    # request side
+++    flow.request.method = method
+++    flow.request.pretty_url = url
+++    flow.request.headers = {"user-agent": "test"}
+++    flow.request.content = req_body
+++
+++    # response side
+++    flow.response.status_code = status_code
+++    flow.response.headers = {"content-type": "application/json"}
+++    flow.response.content = resp_body
+++
+++    return flow
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  Utility tests
+++# ─────────────────────────────────────────────────────────────────
+++
+++@pytest.mark.asyncio
+++async def test_timed_normal():
+++    async def fast():
+++        return [1, 2, 3]
+++    result = await _timed(fast(), timeout=1.0, name="fast")
+++    assert result == [1, 2, 3]
+++
+++
+++@pytest.mark.asyncio
+++async def test_timed_timeout():
+++    async def slow():
+++        await asyncio.sleep(999)
+++        return ["never"]
+++    result = await _timed(slow(), timeout=0.05, name="slow")
+++    assert result == []
+++
+++
+++@pytest.mark.asyncio
+++async def test_timed_exception():
+++    async def boom():
+++        raise ValueError("oops")
+++    result = await _timed(boom(), timeout=1.0, name="boom")
+++    assert result == []
+++
+++
+++def test_flatten_mixed():
+++    findings = [Finding("m", "info", "t", "d", "r")]
+++    result = _flatten([findings, [], Exception("x")])
+++    assert len(result) == 1
+++    assert result[0].module_name == "m"
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  ScanAddon — request hook
+++# ─────────────────────────────────────────────────────────────────
+++
+++@pytest.mark.asyncio
+++async def test_request_hook_populates_metadata():
+++    store = FakeStore()
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow()
+++    await addon.request(flow)
+++
+++    assert "scan_request" in flow.metadata
+++    req = flow.metadata["scan_request"]
+++    assert req.method == "GET"
+++    assert req.url == "https://api.example.com/users"
+++
+++
+++@pytest.mark.asyncio
+++async def test_request_hook_calls_module():
+++    store = FakeStore()
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow(method="POST", url="https://api.example.com/login")
+++    await addon.request(flow)
+++
+++    assert len(mod.requests) == 1
+++    assert mod.requests[0].method == "POST"
+++
+++
+++@pytest.mark.asyncio
+++async def test_request_hook_tolerates_slow_module():
+++    store = FakeStore()
+++    addon = ScanAddon(modules=[SlowModule()], store=store)
+++    addon.__class__  # ensure MODULE_TIMEOUT patch works
+++    import proxy.core.proxy as proxy_mod
+++    orig = proxy_mod.MODULE_TIMEOUT
+++    proxy_mod.MODULE_TIMEOUT = 0.05
+++    try:
+++        flow = _make_flow()
+++        # should complete quickly despite slow module
+++        await asyncio.wait_for(addon.request(flow), timeout=2.0)
+++    finally:
+++        proxy_mod.MODULE_TIMEOUT = orig
+++
+++
+++@pytest.mark.asyncio
+++async def test_request_hook_tolerates_broken_module():
+++    store = FakeStore()
+++    addon = ScanAddon(modules=[BrokenModule()], store=store)
+++    flow = _make_flow()
+++    # must not raise
+++    await addon.request(flow)
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  ScanAddon — response hook
+++# ─────────────────────────────────────────────────────────────────
+++
+++@pytest.mark.asyncio
+++async def test_response_hook_calls_module():
+++    store = FakeStore()
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow(status_code=201)
+++    await addon.request(flow)   # populates metadata
+++    await addon.response(flow)
+++
+++    assert len(mod.responses) == 1
+++    req, resp = mod.responses[0]
+++    assert resp.status_code == 201
+++
+++
+++@pytest.mark.asyncio
+++async def test_response_hook_persists_findings():
+++    store = FakeStore()
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow()
+++    await addon.request(flow)
+++    await addon.response(flow)
+++
+++    findings_rows = store._tables.get("findings", [])
+++    assert len(findings_rows) == 1
+++    assert findings_rows[0]["title"] == "Test finding"
+++
+++
+++@pytest.mark.asyncio
+++async def test_response_hook_without_prior_request():
+++    """response() must work even if request() was never called on this flow."""
+++    store = FakeStore()
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow()
+++    # skip addon.request() — simulate an edge case
+++    await addon.response(flow)
+++
+++    assert len(mod.responses) == 1
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  ScanAddon — findings published to store
+++# ─────────────────────────────────────────────────────────────────
+++
+++@pytest.mark.asyncio
+++async def test_findings_published():
+++    store = FakeStore()
+++    received = []
+++    await store.subscribe("findings", lambda f: received.append(f) or asyncio.sleep(0))
+++
+++    mod = RecordingModule()
+++    addon = ScanAddon(modules=[mod], store=store)
+++
+++    flow = _make_flow()
+++    await addon.request(flow)
+++    await addon.response(flow)
+++
+++    pubs = [p for topic, p in store._published if topic == "findings"]
+++    assert len(pubs) == 1
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  ScanAddon + EndpointMapper integration
+++# ─────────────────────────────────────────────────────────────────
+++
+++@pytest.mark.asyncio
+++async def test_endpoint_mapper_wired_to_proxy():
+++    from proxy.modules.endpoint_mapper import EndpointMapper
+++
+++    store = FakeStore()
+++    mapper = EndpointMapper(store)
+++    addon = ScanAddon(modules=[mapper], store=store)
+++
+++    # First request — should be stored as new endpoint
+++    flow1 = _make_flow(method="GET", url="https://api.example.com/items", status_code=200)
+++    await addon.request(flow1)
+++    await addon.response(flow1)
+++
+++    endpoints = store._tables.get("endpoints", [])
+++    assert len(endpoints) >= 1
+++    assert any(ep["path"] == "/items" for ep in endpoints)
+++
+++    # Findings table should have the "new endpoint" info finding
+++    findings = store._tables.get("findings", [])
+++    assert any(f["title"] == "New endpoint discovered" for f in findings)
+++
+++
+++@pytest.mark.asyncio
+++async def test_endpoint_mapper_deduplication():
+++    from proxy.modules.endpoint_mapper import EndpointMapper
+++
+++    store = FakeStore()
+++    mapper = EndpointMapper(store)
+++    addon = ScanAddon(modules=[mapper], store=store)
+++
+++    url = "https://api.example.com/products"
+++    for _ in range(5):
+++        flow = _make_flow(method="GET", url=url)
+++        await addon.request(flow)
+++        await addon.response(flow)
+++
+++    # Only 1 "New endpoint discovered" finding despite 5 requests
+++    findings = store._tables.get("findings", [])
+++    new_ep_findings = [f for f in findings if f["title"] == "New endpoint discovered"]
+++    assert len(new_ep_findings) == 1
+++
+++
+++@pytest.mark.asyncio
+++async def test_endpoint_mapper_different_methods_counted_separately():
+++    from proxy.modules.endpoint_mapper import EndpointMapper
+++
+++    store = FakeStore()
+++    mapper = EndpointMapper(store)
+++    addon = ScanAddon(modules=[mapper], store=store)
+++
+++    for method in ("GET", "POST", "DELETE"):
+++        flow = _make_flow(method=method, url="https://api.example.com/resource")
+++        await addon.request(flow)
+++        await addon.response(flow)
+++
+++    findings = store._tables.get("findings", [])
+++    new_ep_findings = [f for f in findings if f["title"] == "New endpoint discovered"]
+++    assert len(new_ep_findings) == 3
+++
+++
+++@pytest.mark.asyncio
+++async def test_multiple_modules_all_called():
+++    mod_a = RecordingModule()
+++    mod_a.name = "mod_a"
+++    mod_b = RecordingModule()
+++    mod_b.name = "mod_b"
+++
+++    store = FakeStore()
+++    addon = ScanAddon(modules=[mod_a, mod_b], store=store)
+++
+++    flow = _make_flow()
+++    await addon.request(flow)
+++    await addon.response(flow)
+++
+++    assert len(mod_a.requests) == 1
+++    assert len(mod_b.requests) == 1
+++    assert len(mod_a.responses) == 1
+++    assert len(mod_b.responses) == 1
++-- 
++2.43.0
++
+diff --git a/patches/0002-mitmproxy-integration.patch b/patches/0002-mitmproxy-integration.patch
+new file mode 100644
+index 0000000..e69de29
+diff --git a/proxy/__init__.py b/proxy/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/proxy/brain/__init__.py b/proxy/brain/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/proxy/core/__init__.py b/proxy/core/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/proxy/modules/__init__.py b/proxy/modules/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..ba16422
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,34 @@
++[build-system]
++requires = ["setuptools>=68", "wheel"]
++build-backend = "setuptools.backends.legacy:build"
++
++[project]
++name = "api-scan-engine"
++version = "0.2.0"
++description = "Passive API scanning engine built on mitmproxy"
++requires-python = ">=3.11"
++dependencies = [
++    "mitmproxy>=10.0",
++]
++
++[project.optional-dependencies]
++dev = [
++    "pytest>=7.0",
++    "pytest-asyncio>=0.23",
++]
++
++[project.scripts]
++scan-proxy = "proxy.core.runner:__main__"
++
++[tool.setuptools.packages.find]
++where = ["."]
++include = ["proxy*"]
++
++# ── pytest configuration ──────────────────────────────────────────
++[tool.pytest.ini_options]
++asyncio_mode   = "auto"          # removes need for @pytest.mark.asyncio
++testpaths      = ["tests"]
++pythonpath     = ["."]           # equivalent to conftest sys.path insert
++                                 # supported in pytest >= 7.0
++log_cli        = true
++log_cli_level  = "WARNING"
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_proxy.py b/tests/test_proxy.py
+index 602adc1..11a6fe3 100644
+--- a/tests/test_proxy.py
++++ b/tests/test_proxy.py
+@@ -23,7 +23,7 @@ import asyncio
+ from dataclasses import dataclass, field
+ from datetime import datetime
+ from typing import Any
+-from unittest.mock import AsyncMock, MagicMock, patch
++from unittest.mock import MagicMock
+ 
+ import pytest
+ 
+@@ -190,7 +190,6 @@ def _make_flow(
+ #  Utility tests
+ # ─────────────────────────────────────────────────────────────────
+ 
+-@pytest.mark.asyncio
+ async def test_timed_normal():
+     async def fast():
+         return [1, 2, 3]
+@@ -198,7 +197,6 @@ async def test_timed_normal():
+     assert result == [1, 2, 3]
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_timed_timeout():
+     async def slow():
+         await asyncio.sleep(999)
+@@ -207,7 +205,6 @@ async def test_timed_timeout():
+     assert result == []
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_timed_exception():
+     async def boom():
+         raise ValueError("oops")
+@@ -226,7 +223,6 @@ def test_flatten_mixed():
+ #  ScanAddon — request hook
+ # ─────────────────────────────────────────────────────────────────
+ 
+-@pytest.mark.asyncio
+ async def test_request_hook_populates_metadata():
+     store = FakeStore()
+     mod = RecordingModule()
+@@ -241,7 +237,6 @@ async def test_request_hook_populates_metadata():
+     assert req.url == "https://api.example.com/users"
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_request_hook_calls_module():
+     store = FakeStore()
+     mod = RecordingModule()
+@@ -254,7 +249,6 @@ async def test_request_hook_calls_module():
+     assert mod.requests[0].method == "POST"
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_request_hook_tolerates_slow_module():
+     store = FakeStore()
+     addon = ScanAddon(modules=[SlowModule()], store=store)
+@@ -270,7 +264,6 @@ async def test_request_hook_tolerates_slow_module():
+         proxy_mod.MODULE_TIMEOUT = orig
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_request_hook_tolerates_broken_module():
+     store = FakeStore()
+     addon = ScanAddon(modules=[BrokenModule()], store=store)
+@@ -283,7 +276,6 @@ async def test_request_hook_tolerates_broken_module():
+ #  ScanAddon — response hook
+ # ─────────────────────────────────────────────────────────────────
+ 
+-@pytest.mark.asyncio
+ async def test_response_hook_calls_module():
+     store = FakeStore()
+     mod = RecordingModule()
+@@ -298,7 +290,6 @@ async def test_response_hook_calls_module():
+     assert resp.status_code == 201
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_response_hook_persists_findings():
+     store = FakeStore()
+     mod = RecordingModule()
+@@ -313,7 +304,6 @@ async def test_response_hook_persists_findings():
+     assert findings_rows[0]["title"] == "Test finding"
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_response_hook_without_prior_request():
+     """response() must work even if request() was never called on this flow."""
+     store = FakeStore()
+@@ -331,11 +321,14 @@ async def test_response_hook_without_prior_request():
+ #  ScanAddon — findings published to store
+ # ─────────────────────────────────────────────────────────────────
+ 
+-@pytest.mark.asyncio
+ async def test_findings_published():
+     store = FakeStore()
+     received = []
+-    await store.subscribe("findings", lambda f: received.append(f) or asyncio.sleep(0))
++
++    async def _capture(f):
++        received.append(f)
++
++    await store.subscribe("findings", _capture)
+ 
+     mod = RecordingModule()
+     addon = ScanAddon(modules=[mod], store=store)
+@@ -352,7 +345,6 @@ async def test_findings_published():
+ #  ScanAddon + EndpointMapper integration
+ # ─────────────────────────────────────────────────────────────────
+ 
+-@pytest.mark.asyncio
+ async def test_endpoint_mapper_wired_to_proxy():
+     from proxy.modules.endpoint_mapper import EndpointMapper
+ 
+@@ -374,7 +366,6 @@ async def test_endpoint_mapper_wired_to_proxy():
+     assert any(f["title"] == "New endpoint discovered" for f in findings)
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_endpoint_mapper_deduplication():
+     from proxy.modules.endpoint_mapper import EndpointMapper
+ 
+@@ -394,7 +385,6 @@ async def test_endpoint_mapper_deduplication():
+     assert len(new_ep_findings) == 1
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_endpoint_mapper_different_methods_counted_separately():
+     from proxy.modules.endpoint_mapper import EndpointMapper
+ 
+@@ -412,7 +402,6 @@ async def test_endpoint_mapper_different_methods_counted_separately():
+     assert len(new_ep_findings) == 3
+ 
+ 
+-@pytest.mark.asyncio
+ async def test_multiple_modules_all_called():
+     mod_a = RecordingModule()
+     mod_a.name = "mod_a"
+-- 
+2.43.0
+

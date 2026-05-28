@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "api-scan-engine"
+version = "0.2.0"
+description = "Passive API scanning engine built on mitmproxy"
+requires-python = ">=3.11"
+dependencies = [
+    "mitmproxy>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+scan-proxy = "proxy.core.runner:__main__"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["proxy*"]
+
+# ── pytest configuration ──────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode   = "auto"          # removes need for @pytest.mark.asyncio
+testpaths      = ["tests"]
+pythonpath     = ["."]           # equivalent to conftest sys.path insert
+                                 # supported in pytest >= 7.0
+log_cli        = true
+log_cli_level  = "WARNING"
