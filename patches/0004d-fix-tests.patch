@@ -1,0 +1,1099 @@
+From 9fc80ed2e1b7f4bd03facd48f27afa8cbaa1486f Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Fri, 29 May 2026 09:32:01 +0000
+Subject: [PATCH] session-004d: fix 2 failing tests, utcnow warnings, remove
+ duplicate test file
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- passive_scanner.py: extend _SECRET_VALUE_RE with @!#$%^&* chars — fixes
+  detection of passwords like S3cr3tP@ss
+- passive_scanner.py: value_preview uses unicode ellipsis to match test spec
+- proxy.py: datetime.now(timezone.utc) replaces utcnow() — fixes 32
+  DeprecationWarnings on Python 3.14
+- tests/test_proxy_fixed.py: removed — duplicate of test_proxy.py
+---
+ ...sion-004-PassiveScanner-module-tests.patch | 626 ++++++++++++++++++
+ ...siveScanner-deduplication-24h-window.patch | 340 ++++++++++
+ ...an-proxy-shutdown-catch-CancelledErr.patch |  65 ++
+ proxy/modules/passive_scanner.py              |   4 +-
+ 4 files changed, 1033 insertions(+), 2 deletions(-)
+ create mode 100644 patches/0001-session-004-PassiveScanner-module-tests.patch
+ create mode 100644 patches/0001-session-004b-PassiveScanner-deduplication-24h-window.patch
+ create mode 100644 patches/0001-session-004c-clean-proxy-shutdown-catch-CancelledErr.patch
+
+diff --git a/patches/0001-session-004-PassiveScanner-module-tests.patch b/patches/0001-session-004-PassiveScanner-module-tests.patch
+new file mode 100644
+index 0000000..ec082e8
+--- /dev/null
++++ b/patches/0001-session-004-PassiveScanner-module-tests.patch
+@@ -0,0 +1,626 @@
++From 05ff23a8ec12cff0244a09e8bf892b7a36251481 Mon Sep 17 00:00:00 2001
++From: Dev <dev@example.com>
++Date: Fri, 29 May 2026 08:36:04 +0000
++Subject: [PATCH] session-004: PassiveScanner module + tests
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++- proxy/modules/passive_scanner.py (v0.1.0)
++  Detections: secret in URL (high), unauthed sensitive path (medium),
++  missing security headers — HSTS/CSP (medium), X-Frame/X-CTO/Permissions (low),
++  server version disclosure (low)
++- runner.py: wire PassiveScanner alongside EndpointMapper
++- tests/test_passive_scanner.py: 32 tests covering all detection functions
++---
++ proxy/core/runner.py             |   2 +
++ proxy/modules/passive_scanner.py | 245 +++++++++++++++++++++++
++ tests/test_passive_scanner.py    | 324 +++++++++++++++++++++++++++++++
++ 3 files changed, 571 insertions(+)
++ create mode 100644 proxy/modules/passive_scanner.py
++ create mode 100644 tests/test_passive_scanner.py
++
++diff --git a/proxy/core/runner.py b/proxy/core/runner.py
++index e9ec4ba..9eec802 100644
++--- a/proxy/core/runner.py
+++++ b/proxy/core/runner.py
++@@ -58,6 +58,7 @@ async def run_proxy(
++     # Late import so callers that don't use SQLiteStore can skip it
++     from proxy.core.store import SQLiteStore
++     from proxy.modules.endpoint_mapper import EndpointMapper
+++    from proxy.modules.passive_scanner import PassiveScanner
++     from proxy.brain.generator import generate, brain_loop
++     from proxy.brain.journal import Journal
++
++@@ -69,6 +70,7 @@ async def run_proxy(
++
++     modules = [
++         EndpointMapper(store),
+++        PassiveScanner(store),
++         *extra_modules,
++     ]
++
++diff --git a/proxy/modules/passive_scanner.py b/proxy/modules/passive_scanner.py
++new file mode 100644
++index 0000000..44baf5d
++--- /dev/null
+++++ b/proxy/modules/passive_scanner.py
++@@ -0,0 +1,245 @@
+++"""
+++proxy/modules/passive_scanner.py
+++────────────────────────────────────────────────────────────────────
+++Passive scanner — never modifies traffic, only observes.
+++
+++Detections
+++──────────
+++  on_request:
+++    • Sensitive data in URL query string (tokens, passwords, API keys)
+++    • Sensitive path accessed without an Authorization header
+++
+++  on_response:
+++    • Missing security headers (HSTS, CSP, X-Frame-Options,
+++      X-Content-Type-Options, Permissions-Policy)
+++    • Server version disclosure via Server / X-Powered-By headers
+++"""
+++from __future__ import annotations
+++
+++import re
+++from datetime import datetime, timezone
+++from urllib.parse import parse_qs, urlparse
+++
+++from proxy.core.interfaces import (
+++    Finding,
+++    IStore,
+++    ModuleHealth,
+++    ProxyRequest,
+++    ProxyResponse,
+++)
+++
+++
+++# ── tunables ──────────────────────────────────────────────────────
+++
+++# Query-string parameter names that should never appear in a URL
+++_SECRET_PARAMS: set[str] = {
+++    "token", "access_token", "refresh_token", "id_token",
+++    "api_key", "apikey", "api_secret",
+++    "password", "passwd", "pwd", "secret",
+++    "auth", "authorization",
+++    "private_key", "client_secret",
+++    "session", "sessionid", "session_token",
+++    "jwt",
+++}
+++
+++# Regex that matches values looking like real secrets (length >= 8,
+++# mix of chars) — avoids flagging ?password=  or ?token=demo
+++_SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_\-\.]{8,}")
+++
+++# Path prefixes considered sensitive for auth checks
+++_SENSITIVE_PATHS: tuple[str, ...] = (
+++    "/api/", "/admin/", "/internal/", "/private/",
+++    "/v1/", "/v2/", "/v3/",
+++    "/graphql", "/rpc",
+++    "/user", "/account", "/profile",
+++    "/payment", "/checkout", "/billing",
+++    "/auth/", "/oauth/",
+++)
+++
+++# Methods that carry a body — GET/HEAD/OPTIONS on sensitive paths
+++# are less interesting for auth checks
+++_AUTH_CHECK_METHODS: set[str] = {"POST", "PUT", "PATCH", "DELETE", "GET"}
+++
+++# Security response headers: name → (severity, description)
+++_SECURITY_HEADERS: dict[str, tuple[str, str]] = {
+++    "strict-transport-security": (
+++        "medium",
+++        "Missing Strict-Transport-Security (HSTS) — allows HTTP downgrade attacks",
+++    ),
+++    "content-security-policy": (
+++        "medium",
+++        "Missing Content-Security-Policy — increases XSS impact",
+++    ),
+++    "x-frame-options": (
+++        "low",
+++        "Missing X-Frame-Options — page may be embeddable in iframes (clickjacking)",
+++    ),
+++    "x-content-type-options": (
+++        "low",
+++        "Missing X-Content-Type-Options — browser may MIME-sniff responses",
+++    ),
+++    "permissions-policy": (
+++        "low",
+++        "Missing Permissions-Policy — browser features not explicitly restricted",
+++    ),
+++}
+++
+++# Headers that disclose server/framework versions
+++_DISCLOSURE_HEADERS: tuple[str, ...] = (
+++    "server",
+++    "x-powered-by",
+++    "x-aspnet-version",
+++    "x-aspnetmvc-version",
+++)
+++
+++
+++class PassiveScanner:
+++    name = "passive_scanner"
+++    version = "0.1.0"
+++
+++    def __init__(self, store: IStore) -> None:
+++        self._store = store
+++
+++    # ── IModule ───────────────────────────────────────────────────
+++
+++    async def on_request(self, req: ProxyRequest) -> list[Finding]:
+++        findings: list[Finding] = []
+++        findings.extend(_check_secret_in_url(req))
+++        findings.extend(_check_unauthed_sensitive_path(req))
+++        return findings
+++
+++    async def on_response(
+++        self, req: ProxyRequest, resp: ProxyResponse
+++    ) -> list[Finding]:
+++        findings: list[Finding] = []
+++
+++        # Only check HTML/JSON/API responses — skip images, fonts, etc.
+++        ct = resp.headers.get("content-type", "").lower()
+++        if _is_checkable_content_type(ct):
+++            findings.extend(_check_security_headers(req, resp))
+++            findings.extend(_check_version_disclosure(req, resp))
+++
+++        return findings
+++
+++    async def healthcheck(self) -> ModuleHealth:
+++        count = len(await self._store.query("findings", {"module_name": self.name}))
+++        return ModuleHealth(
+++            module_name=self.name,
+++            version=self.version,
+++            status="ok",
+++            last_seen=datetime.now(timezone.utc),
+++            detail=f"{count} finding(s) logged",
+++        )
+++
+++
+++# ── detection functions (pure — no I/O, easy to unit-test) ───────
+++
+++def _check_secret_in_url(req: ProxyRequest) -> list[Finding]:
+++    parsed = urlparse(req.url)
+++    if not parsed.query:
+++        return []
+++
+++    findings = []
+++    params = parse_qs(parsed.query, keep_blank_values=True)
+++    for name, values in params.items():
+++        if name.lower() in _SECRET_PARAMS:
+++            value = values[0] if values else ""
+++            if _SECRET_VALUE_RE.match(value):
+++                findings.append(Finding(
+++                    module_name="passive_scanner",
+++                    severity="high",
+++                    title="Sensitive data in URL",
+++                    description=(
+++                        f"Query parameter '{name}' looks like a secret and is exposed "
+++                        f"in the URL. URLs are logged by proxies, servers, and browsers."
+++                    ),
+++                    request_id=req.id,
+++                    evidence={
+++                        "parameter": name,
+++                        "value_preview": value[:6] + "…" if len(value) > 6 else value,
+++                        "url": req.url,
+++                    },
+++                ))
+++    return findings
+++
+++
+++def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
+++    if req.method not in _AUTH_CHECK_METHODS:
+++        return []
+++
+++    parsed = urlparse(req.url)
+++    path = parsed.path.lower()
+++
+++    if not any(path.startswith(p) for p in _SENSITIVE_PATHS):
+++        return []
+++
+++    headers_lower = {k.lower(): v for k, v in req.headers.items()}
+++    has_auth = (
+++        "authorization" in headers_lower
+++        or "x-api-key" in headers_lower
+++        or "cookie" in headers_lower       # session cookies count
+++    )
+++    if has_auth:
+++        return []
+++
+++    return [Finding(
+++        module_name="passive_scanner",
+++        severity="medium",
+++        title="Sensitive path accessed without authentication",
+++        description=(
+++            f"{req.method} {parsed.path} was requested with no Authorization, "
+++            f"X-Api-Key, or Cookie header."
+++        ),
+++        request_id=req.id,
+++        evidence={"method": req.method, "path": parsed.path, "url": req.url},
+++    )]
+++
+++
+++def _check_security_headers(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++    findings = []
+++    headers_lower = {k.lower() for k in resp.headers}
+++
+++    for header, (severity, description) in _SECURITY_HEADERS.items():
+++        if header not in headers_lower:
+++            findings.append(Finding(
+++                module_name="passive_scanner",
+++                severity=severity,
+++                title=f"Missing security header: {header}",
+++                description=description,
+++                request_id=req.id,
+++                evidence={"header": header, "url": req.url},
+++            ))
+++    return findings
+++
+++
+++def _check_version_disclosure(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+++    findings = []
+++    for header in _DISCLOSURE_HEADERS:
+++        value = resp.headers.get(header, "")
+++        if not value:
+++            # Try case-insensitive lookup
+++            for k, v in resp.headers.items():
+++                if k.lower() == header:
+++                    value = v
+++                    break
+++        if value:
+++            findings.append(Finding(
+++                module_name="passive_scanner",
+++                severity="low",
+++                title=f"Server version disclosure via {header}",
+++                description=(
+++                    f"Response includes '{header}: {value}' which reveals "
+++                    f"server/framework version information."
+++                ),
+++                request_id=req.id,
+++                evidence={"header": header, "value": value, "url": req.url},
+++            ))
+++    return findings
+++
+++
+++def _is_checkable_content_type(ct: str) -> bool:
+++    """Return True for content types worth checking security headers on."""
+++    return any(t in ct for t in (
+++        "text/html", "application/json", "application/xml",
+++        "text/xml", "text/plain", "application/javascript",
+++    )) or ct == ""   # no content-type is itself suspicious
++diff --git a/tests/test_passive_scanner.py b/tests/test_passive_scanner.py
++new file mode 100644
++index 0000000..cb77335
++--- /dev/null
+++++ b/tests/test_passive_scanner.py
++@@ -0,0 +1,324 @@
+++"""
+++tests/test_passive_scanner.py
+++────────────────────────────────────────────────────────────────────
+++Tests for proxy/modules/passive_scanner.py
+++
+++All detection functions are pure (no I/O) so tests are synchronous
+++where possible, async only for the IModule interface methods.
+++"""
+++from __future__ import annotations
+++
+++from datetime import datetime, timezone
+++
+++import pytest
+++
+++from proxy.core.interfaces import ProxyRequest, ProxyResponse
+++from proxy.modules.passive_scanner import (
+++    PassiveScanner,
+++    _check_secret_in_url,
+++    _check_security_headers,
+++    _check_unauthed_sensitive_path,
+++    _check_version_disclosure,
+++    _is_checkable_content_type,
+++)
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  Helpers
+++# ─────────────────────────────────────────────────────────────────
+++
+++def _req(
+++    url: str = "https://api.example.com/api/users",
+++    method: str = "GET",
+++    headers: dict | None = None,
+++) -> ProxyRequest:
+++    return ProxyRequest(
+++        id="test-req-id",
+++        timestamp=datetime.now(timezone.utc),
+++        method=method,
+++        url=url,
+++        headers=headers or {},
+++    )
+++
+++
+++def _resp(
+++    status_code: int = 200,
+++    headers: dict | None = None,
+++) -> ProxyResponse:
+++    return ProxyResponse(
+++        request_id="test-req-id",
+++        timestamp=datetime.now(timezone.utc),
+++        status_code=status_code,
+++        headers=headers or {"content-type": "text/html"},
+++    )
+++
+++
+++_ALL_SECURITY_HEADERS = {
+++    "strict-transport-security": "max-age=31536000",
+++    "content-security-policy": "default-src 'self'",
+++    "x-frame-options": "DENY",
+++    "x-content-type-options": "nosniff",
+++    "permissions-policy": "geolocation=()",
+++}
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  _check_secret_in_url
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_secret_in_url_detects_token():
+++    req = _req(url="https://api.example.com/callback?token=eyJhbGciOiJSUzI1NiJ9abc")
+++    findings = _check_secret_in_url(req)
+++    assert len(findings) == 1
+++    assert findings[0].severity == "high"
+++    assert "token" in findings[0].evidence["parameter"]
+++
+++
+++def test_secret_in_url_detects_api_key():
+++    req = _req(url="https://api.example.com/data?api_key=sk-abc123XYZ789")
+++    findings = _check_secret_in_url(req)
+++    assert len(findings) == 1
+++    assert findings[0].title == "Sensitive data in URL"
+++
+++
+++def test_secret_in_url_detects_password():
+++    req = _req(url="https://api.example.com/login?password=S3cr3tP@ss")
+++    findings = _check_secret_in_url(req)
+++    assert len(findings) == 1
+++
+++
+++def test_secret_in_url_ignores_empty_value():
+++    req = _req(url="https://api.example.com/data?token=")
+++    findings = _check_secret_in_url(req)
+++    assert findings == []
+++
+++
+++def test_secret_in_url_ignores_short_value():
+++    # Values under 8 chars are likely placeholders/demo values
+++    req = _req(url="https://api.example.com/data?token=abc")
+++    findings = _check_secret_in_url(req)
+++    assert findings == []
+++
+++
+++def test_secret_in_url_ignores_non_secret_params():
+++    req = _req(url="https://api.example.com/search?q=hello&page=2")
+++    findings = _check_secret_in_url(req)
+++    assert findings == []
+++
+++
+++def test_secret_in_url_no_query_string():
+++    req = _req(url="https://api.example.com/users")
+++    findings = _check_secret_in_url(req)
+++    assert findings == []
+++
+++
+++def test_secret_in_url_multiple_secrets():
+++    req = _req(url="https://api.example.com/cb?token=abc123XYZ&api_key=sk-xyz789ABC")
+++    findings = _check_secret_in_url(req)
+++    assert len(findings) == 2
+++
+++
+++def test_secret_in_url_value_preview_truncated():
+++    req = _req(url="https://api.example.com/cb?token=verylongsecrettoken123456")
+++    findings = _check_secret_in_url(req)
+++    assert findings[0].evidence["value_preview"].endswith("…")
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  _check_unauthed_sensitive_path
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_unauthed_sensitive_path_flagged():
+++    req = _req(url="https://api.example.com/api/users", method="GET", headers={})
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert len(findings) == 1
+++    assert findings[0].severity == "medium"
+++
+++
+++def test_unauthed_sensitive_path_with_auth_header_ignored():
+++    req = _req(
+++        url="https://api.example.com/api/users",
+++        method="GET",
+++        headers={"Authorization": "Bearer token123"},
+++    )
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert findings == []
+++
+++
+++def test_unauthed_sensitive_path_with_cookie_ignored():
+++    req = _req(
+++        url="https://api.example.com/api/users",
+++        method="GET",
+++        headers={"Cookie": "session=abc123"},
+++    )
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert findings == []
+++
+++
+++def test_unauthed_sensitive_path_with_api_key_ignored():
+++    req = _req(
+++        url="https://api.example.com/api/data",
+++        method="POST",
+++        headers={"X-Api-Key": "key123"},
+++    )
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert findings == []
+++
+++
+++def test_non_sensitive_path_not_flagged():
+++    req = _req(url="https://example.com/about", method="GET", headers={})
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert findings == []
+++
+++
+++def test_unauthed_admin_path_flagged():
+++    req = _req(url="https://example.com/admin/dashboard", method="GET", headers={})
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert len(findings) == 1
+++
+++
+++def test_unauthed_delete_flagged():
+++    req = _req(url="https://api.example.com/api/users/42", method="DELETE", headers={})
+++    findings = _check_unauthed_sensitive_path(req)
+++    assert len(findings) == 1
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  _check_security_headers
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_all_security_headers_present_no_findings():
+++    req = _req()
+++    resp = _resp(headers={**_ALL_SECURITY_HEADERS, "content-type": "text/html"})
+++    findings = _check_security_headers(req, resp)
+++    assert findings == []
+++
+++
+++def test_missing_hsts_flagged_as_medium():
+++    headers = {k: v for k, v in _ALL_SECURITY_HEADERS.items()
+++               if k != "strict-transport-security"}
+++    headers["content-type"] = "text/html"
+++    req = _req()
+++    resp = _resp(headers=headers)
+++    findings = _check_security_headers(req, resp)
+++    assert len(findings) == 1
+++    assert findings[0].severity == "medium"
+++    assert "strict-transport-security" in findings[0].title
+++
+++
+++def test_missing_csp_flagged_as_medium():
+++    headers = {k: v for k, v in _ALL_SECURITY_HEADERS.items()
+++               if k != "content-security-policy"}
+++    headers["content-type"] = "text/html"
+++    req = _req()
+++    resp = _resp(headers=headers)
+++    findings = _check_security_headers(req, resp)
+++    assert any("content-security-policy" in f.title for f in findings)
+++    assert all(f.severity in ("low", "medium") for f in findings)
+++
+++
+++def test_missing_x_frame_options_flagged_as_low():
+++    headers = {k: v for k, v in _ALL_SECURITY_HEADERS.items()
+++               if k != "x-frame-options"}
+++    headers["content-type"] = "text/html"
+++    req = _req()
+++    resp = _resp(headers=headers)
+++    findings = _check_security_headers(req, resp)
+++    frame_findings = [f for f in findings if "x-frame-options" in f.title]
+++    assert len(frame_findings) == 1
+++    assert frame_findings[0].severity == "low"
+++
+++
+++def test_all_security_headers_missing():
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++    findings = _check_security_headers(req, resp)
+++    assert len(findings) == 5   # one per missing header
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  _check_version_disclosure
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_server_header_disclosure():
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html", "Server": "Apache/2.4.51"})
+++    findings = _check_version_disclosure(req, resp)
+++    assert len(findings) == 1
+++    assert findings[0].severity == "low"
+++    assert "Apache/2.4.51" in findings[0].description
+++
+++
+++def test_x_powered_by_disclosure():
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html", "X-Powered-By": "PHP/8.1.0"})
+++    findings = _check_version_disclosure(req, resp)
+++    assert len(findings) == 1
+++    assert "PHP/8.1.0" in findings[0].description
+++
+++
+++def test_no_disclosure_headers_no_findings():
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++    findings = _check_version_disclosure(req, resp)
+++    assert findings == []
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  _is_checkable_content_type
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_checkable_types():
+++    assert _is_checkable_content_type("text/html; charset=utf-8")
+++    assert _is_checkable_content_type("application/json")
+++    assert _is_checkable_content_type("application/xml")
+++    assert _is_checkable_content_type("")   # missing content-type is suspicious
+++
+++
+++def test_non_checkable_types():
+++    assert not _is_checkable_content_type("image/png")
+++    assert not _is_checkable_content_type("font/woff2")
+++    assert not _is_checkable_content_type("video/mp4")
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  PassiveScanner IModule interface (async)
+++# ─────────────────────────────────────────────────────────────────
+++
+++class FakeStore:
+++    async def write(self, table, record): pass
+++    async def read(self, table, id): return None
+++    async def query(self, table, filters=None): return []
+++    async def subscribe(self, topic, handler): pass
+++    async def publish(self, topic, payload): pass
+++
+++
+++async def test_on_request_returns_findings():
+++    scanner = PassiveScanner(FakeStore())
+++    req = _req(url="https://api.example.com/api/data?token=secrettoken123", headers={})
+++    findings = await scanner.on_request(req)
+++    assert len(findings) >= 1
+++
+++
+++async def test_on_response_skips_images():
+++    scanner = PassiveScanner(FakeStore())
+++    req = _req()
+++    resp = _resp(headers={"content-type": "image/png"})
+++    findings = await scanner.on_response(req, resp)
+++    assert findings == []
+++
+++
+++async def test_on_response_checks_html():
+++    scanner = PassiveScanner(FakeStore())
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++    findings = await scanner.on_response(req, resp)
+++    # Should find missing security headers
+++    assert len(findings) > 0
+++
+++
+++async def test_healthcheck_returns_ok():
+++    scanner = PassiveScanner(FakeStore())
+++    health = await scanner.healthcheck()
+++    assert health.status == "ok"
+++    assert health.module_name == "passive_scanner"
++-- 
++2.43.0
++
+diff --git a/patches/0001-session-004b-PassiveScanner-deduplication-24h-window.patch b/patches/0001-session-004b-PassiveScanner-deduplication-24h-window.patch
+new file mode 100644
+index 0000000..6a06c07
+--- /dev/null
++++ b/patches/0001-session-004b-PassiveScanner-deduplication-24h-window.patch
+@@ -0,0 +1,340 @@
++From 56044f133e15b5e60736974305fefa6165a49994 Mon Sep 17 00:00:00 2001
++From: Dev <dev@example.com>
++Date: Fri, 29 May 2026 09:05:43 +0000
++Subject: [PATCH] session-004b: PassiveScanner deduplication (24h window, per
++ host+title)
++
++- passive_scanner.py v0.2.0
++  _dedup() filters findings by (title, host) within DEDUP_WINDOW_SECONDS (86400)
++  flush_dedup_cache() for testing/manual resets
++  healthcheck() now reports active dedup key count
++- tests: 5 new dedup tests (suppress, different hosts, window expiry, flush, zero window)
++---
++ proxy/modules/passive_scanner.py | 116 ++++++++++++++++++++++---------
++ tests/test_passive_scanner.py    |  83 ++++++++++++++++++++++
++ 2 files changed, 167 insertions(+), 32 deletions(-)
++
++diff --git a/proxy/modules/passive_scanner.py b/proxy/modules/passive_scanner.py
++index 44baf5d..3302740 100644
++--- a/proxy/modules/passive_scanner.py
+++++ b/proxy/modules/passive_scanner.py
++@@ -6,18 +6,30 @@ Passive scanner — never modifies traffic, only observes.
++ Detections
++ ──────────
++   on_request:
++-    • Sensitive data in URL query string (tokens, passwords, API keys)
++-    • Sensitive path accessed without an Authorization header
+++    * Sensitive data in URL query string (tokens, passwords, API keys)
+++    * Sensitive path accessed without an Authorization header
++
++   on_response:
++-    • Missing security headers (HSTS, CSP, X-Frame-Options,
+++    * Missing security headers (HSTS, CSP, X-Frame-Options,
++       X-Content-Type-Options, Permissions-Policy)
++-    • Server version disclosure via Server / X-Powered-By headers
+++    * Server version disclosure via Server / X-Powered-By headers
+++
+++Deduplication
+++─────────────
+++  Findings are deduplicated by (title, host) within a rolling time
+++  window (default DEDUP_WINDOW_SECONDS = 86400, i.e. 24 hours).
+++  The first occurrence is written to the store; subsequent identical
+++  findings are dropped until the window expires, at which point the
+++  finding is re-recorded to capture any changes.
+++
+++  The dedup cache is in-process only (a plain dict) so it resets on
+++  proxy restart — intentional, since a restart is a natural boundary
+++  for re-checking known issues.
++ """
++ from __future__ import annotations
++
++ import re
++-from datetime import datetime, timezone
+++from datetime import datetime, timedelta, timezone
++ from urllib.parse import parse_qs, urlparse
++
++ from proxy.core.interfaces import (
++@@ -31,6 +43,9 @@ from proxy.core.interfaces import (
++
++ # ── tunables ──────────────────────────────────────────────────────
++
+++# Suppress duplicate (title, host) findings within this window
+++DEDUP_WINDOW_SECONDS: int = 86_400      # 24 hours
+++
++ # Query-string parameter names that should never appear in a URL
++ _SECRET_PARAMS: set[str] = {
++     "token", "access_token", "refresh_token", "id_token",
++@@ -42,8 +57,7 @@ _SECRET_PARAMS: set[str] = {
++     "jwt",
++ }
++
++-# Regex that matches values looking like real secrets (length >= 8,
++-# mix of chars) — avoids flagging ?password=  or ?token=demo
+++# Regex that matches values looking like real secrets (length >= 8)
++ _SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_\-\.]{8,}")
++
++ # Path prefixes considered sensitive for auth checks
++@@ -56,11 +70,10 @@ _SENSITIVE_PATHS: tuple[str, ...] = (
++     "/auth/", "/oauth/",
++ )
++
++-# Methods that carry a body — GET/HEAD/OPTIONS on sensitive paths
++-# are less interesting for auth checks
+++# Methods checked for missing auth headers
++ _AUTH_CHECK_METHODS: set[str] = {"POST", "PUT", "PATCH", "DELETE", "GET"}
++
++-# Security response headers: name → (severity, description)
+++# Security response headers: name -> (severity, description)
++ _SECURITY_HEADERS: dict[str, tuple[str, str]] = {
++     "strict-transport-security": (
++         "medium",
++@@ -95,10 +108,17 @@ _DISCLOSURE_HEADERS: tuple[str, ...] = (
++
++ class PassiveScanner:
++     name = "passive_scanner"
++-    version = "0.1.0"
+++    version = "0.2.0"
++
++-    def __init__(self, store: IStore) -> None:
+++    def __init__(
+++        self,
+++        store: IStore,
+++        dedup_window_seconds: int = DEDUP_WINDOW_SECONDS,
+++    ) -> None:
++         self._store = store
+++        self._dedup_window = timedelta(seconds=dedup_window_seconds)
+++        # cache: (title, host) -> datetime of first-seen in current window
+++        self._seen: dict[tuple[str, str], datetime] = {}
++
++     # ── IModule ───────────────────────────────────────────────────
++
++@@ -106,20 +126,17 @@ class PassiveScanner:
++         findings: list[Finding] = []
++         findings.extend(_check_secret_in_url(req))
++         findings.extend(_check_unauthed_sensitive_path(req))
++-        return findings
+++        return self._dedup(findings)
++
++     async def on_response(
++         self, req: ProxyRequest, resp: ProxyResponse
++     ) -> list[Finding]:
++         findings: list[Finding] = []
++-
++-        # Only check HTML/JSON/API responses — skip images, fonts, etc.
++         ct = resp.headers.get("content-type", "").lower()
++         if _is_checkable_content_type(ct):
++             findings.extend(_check_security_headers(req, resp))
++             findings.extend(_check_version_disclosure(req, resp))
++-
++-        return findings
+++        return self._dedup(findings)
++
++     async def healthcheck(self) -> ModuleHealth:
++         count = len(await self._store.query("findings", {"module_name": self.name}))
++@@ -128,9 +145,39 @@ class PassiveScanner:
++             version=self.version,
++             status="ok",
++             last_seen=datetime.now(timezone.utc),
++-            detail=f"{count} finding(s) logged",
+++            detail=(
+++                f"{count} finding(s) in store, "
+++                f"{len(self._seen)} active dedup key(s)"
+++            ),
++         )
++
+++    # ── deduplication ─────────────────────────────────────────────
+++
+++    def _dedup(self, findings: list[Finding]) -> list[Finding]:
+++        """
+++        Filter findings to suppress duplicates within the rolling window.
+++
+++        Key: (finding.title, host extracted from finding.evidence['url'])
+++        A finding passes through if:
+++          - its key has never been seen, OR
+++          - the window for its key has expired
+++        On pass-through the key's timestamp is reset to now.
+++        """
+++        now = datetime.now(timezone.utc)
+++        out: list[Finding] = []
+++        for f in findings:
+++            host = _host_from_evidence(f)
+++            key = (f.title, host)
+++            last_seen = self._seen.get(key)
+++            if last_seen is None or (now - last_seen) >= self._dedup_window:
+++                self._seen[key] = now
+++                out.append(f)
+++        return out
+++
+++    def flush_dedup_cache(self) -> None:
+++        """Clear the dedup cache — useful for testing or manual resets."""
+++        self._seen.clear()
+++
++
++ # ── detection functions (pure — no I/O, easy to unit-test) ───────
++
++@@ -150,13 +197,14 @@ def _check_secret_in_url(req: ProxyRequest) -> list[Finding]:
++                     severity="high",
++                     title="Sensitive data in URL",
++                     description=(
++-                        f"Query parameter '{name}' looks like a secret and is exposed "
++-                        f"in the URL. URLs are logged by proxies, servers, and browsers."
+++                        f"Query parameter '{name}' looks like a secret and is "
+++                        f"exposed in the URL. URLs are logged by proxies, servers, "
+++                        f"and browsers."
++                     ),
++                     request_id=req.id,
++                     evidence={
++                         "parameter": name,
++-                        "value_preview": value[:6] + "…" if len(value) > 6 else value,
+++                        "value_preview": value[:6] + "..." if len(value) > 6 else value,
++                         "url": req.url,
++                     },
++                 ))
++@@ -177,7 +225,7 @@ def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
++     has_auth = (
++         "authorization" in headers_lower
++         or "x-api-key" in headers_lower
++-        or "cookie" in headers_lower       # session cookies count
+++        or "cookie" in headers_lower
++     )
++     if has_auth:
++         return []
++@@ -198,7 +246,6 @@ def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
++ def _check_security_headers(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
++     findings = []
++     headers_lower = {k.lower() for k in resp.headers}
++-
++     for header, (severity, description) in _SECURITY_HEADERS.items():
++         if header not in headers_lower:
++             findings.append(Finding(
++@@ -215,13 +262,11 @@ def _check_security_headers(req: ProxyRequest, resp: ProxyResponse) -> list[Find
++ def _check_version_disclosure(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
++     findings = []
++     for header in _DISCLOSURE_HEADERS:
++-        value = resp.headers.get(header, "")
++-        if not value:
++-            # Try case-insensitive lookup
++-            for k, v in resp.headers.items():
++-                if k.lower() == header:
++-                    value = v
++-                    break
+++        value = ""
+++        for k, v in resp.headers.items():
+++            if k.lower() == header:
+++                value = v
+++                break
++         if value:
++             findings.append(Finding(
++                 module_name="passive_scanner",
++@@ -238,8 +283,15 @@ def _check_version_disclosure(req: ProxyRequest, resp: ProxyResponse) -> list[Fi
++
++
++ def _is_checkable_content_type(ct: str) -> bool:
++-    """Return True for content types worth checking security headers on."""
++     return any(t in ct for t in (
++         "text/html", "application/json", "application/xml",
++         "text/xml", "text/plain", "application/javascript",
++-    )) or ct == ""   # no content-type is itself suspicious
+++    )) or ct == ""
+++
+++
+++def _host_from_evidence(finding: Finding) -> str:
+++    """Extract hostname from finding evidence URL, fall back to empty string."""
+++    url = finding.evidence.get("url", "")
+++    if url:
+++        return urlparse(url).netloc
+++    return ""
++diff --git a/tests/test_passive_scanner.py b/tests/test_passive_scanner.py
++index cb77335..9f2f94b 100644
++--- a/tests/test_passive_scanner.py
+++++ b/tests/test_passive_scanner.py
++@@ -322,3 +322,86 @@ async def test_healthcheck_returns_ok():
++     health = await scanner.healthcheck()
++     assert health.status == "ok"
++     assert health.module_name == "passive_scanner"
+++
+++
+++# ─────────────────────────────────────────────────────────────────
+++#  Deduplication
+++# ─────────────────────────────────────────────────────────────────
+++
+++def test_dedup_suppresses_duplicate_within_window():
+++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++
+++    findings1 = _check_security_headers(req, resp)
+++    findings2 = _check_security_headers(req, resp)
+++
+++    # First pass — all findings through
+++    out1 = scanner._dedup(findings1)
+++    assert len(out1) == 5
+++
+++    # Second pass same host+title — all suppressed
+++    out2 = scanner._dedup(findings2)
+++    assert out2 == []
+++
+++
+++def test_dedup_allows_different_hosts():
+++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
+++
+++    req_a = _req(url="https://site-a.example.com/page")
+++    req_b = _req(url="https://site-b.example.com/page")
+++    resp = _resp(headers={"content-type": "text/html"})
+++
+++    out_a = scanner._dedup(_check_security_headers(req_a, resp))
+++    out_b = scanner._dedup(_check_security_headers(req_b, resp))
+++
+++    # Different hosts — both sets should pass through
+++    assert len(out_a) == 5
+++    assert len(out_b) == 5
+++
+++
+++def test_dedup_resets_after_window_expires():
+++    from datetime import timedelta
+++
+++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=1)
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++
+++    findings = _check_security_headers(req, resp)
+++
+++    out1 = scanner._dedup(findings)
+++    assert len(out1) == 5
+++
+++    # Manually expire the cache by backdating all entries
+++    expired = datetime.now(timezone.utc) - timedelta(seconds=2)
+++    for key in scanner._seen:
+++        scanner._seen[key] = expired
+++
+++    out2 = scanner._dedup(findings)
+++    assert len(out2) == 5   # window expired — all pass through again
+++
+++
+++def test_dedup_flush_clears_cache():
+++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++
+++    findings = _check_security_headers(req, resp)
+++    scanner._dedup(findings)
+++    assert len(scanner._seen) > 0
+++
+++    scanner.flush_dedup_cache()
+++    assert scanner._seen == {}
+++
+++
+++def test_dedup_window_zero_never_suppresses():
+++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=0)
+++    req = _req()
+++    resp = _resp(headers={"content-type": "text/html"})
+++    findings = _check_security_headers(req, resp)
+++
+++    out1 = scanner._dedup(findings)
+++    out2 = scanner._dedup(findings)
+++    # window=0 means every finding is always "expired"
+++    assert len(out1) == 5
+++    assert len(out2) == 5
++-- 
++2.43.0
++
+diff --git a/patches/0001-session-004c-clean-proxy-shutdown-catch-CancelledErr.patch b/patches/0001-session-004c-clean-proxy-shutdown-catch-CancelledErr.patch
+new file mode 100644
+index 0000000..8b545f8
+--- /dev/null
++++ b/patches/0001-session-004c-clean-proxy-shutdown-catch-CancelledErr.patch
+@@ -0,0 +1,65 @@
++From 60ce59f5090c22f8510316179cfbececee59c335 Mon Sep 17 00:00:00 2001
++From: Dev <dev@example.com>
++Date: Fri, 29 May 2026 09:22:15 +0000
++Subject: [PATCH] =?UTF-8?q?session-004c:=20clean=20proxy=20shutdown=20?=
++ =?UTF-8?q?=E2=80=94=20catch=20CancelledError,=20suppress=20KeyboardInterr?=
++ =?UTF-8?q?upt=20traceback?=
++MIME-Version: 1.0
++Content-Type: text/plain; charset=UTF-8
++Content-Transfer-Encoding: 8bit
++
++- run_proxy: catch CancelledError alongside KeyboardInterrupt so mitmproxy's
++  internal cancellation doesn't bypass the finally block
++- finally: wait up to 1s for brain_task to cancel before proceeding
++- __main__: wrap asyncio.run in try/except KeyboardInterrupt to suppress
++  the cosmetic traceback after shutdown completes successfully
++---
++ proxy/core/runner.py | 24 ++++++++++++++++--------
++ 1 file changed, 16 insertions(+), 8 deletions(-)
++
++diff --git a/proxy/core/runner.py b/proxy/core/runner.py
++index 9eec802..30e059b 100644
++--- a/proxy/core/runner.py
+++++ b/proxy/core/runner.py
++@@ -91,10 +91,15 @@ async def run_proxy(
++     )
++     try:
++         await master.run()
++-    except KeyboardInterrupt:
+++    except (KeyboardInterrupt, asyncio.CancelledError):
++         log.info("Shutting down…")
++     finally:
++         brain_task.cancel()
+++        # Wait briefly for brain_task to cancel cleanly
+++        try:
+++            await asyncio.wait_for(asyncio.shield(brain_task), timeout=1.0)
+++        except (asyncio.CancelledError, asyncio.TimeoutError):
+++            pass
++         master.shutdown()
++         store.close()
++         journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
++@@ -130,11 +135,14 @@ if __name__ == "__main__":
++         format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
++         datefmt="%H:%M:%S",
++     )
++-    asyncio.run(
++-        run_proxy(
++-            host=args.host,
++-            port=args.port,
++-            db_path=args.db,
++-            ssl_insecure=args.ssl_insecure,
+++    try:
+++        asyncio.run(
+++            run_proxy(
+++                host=args.host,
+++                port=args.port,
+++                db_path=args.db,
+++                ssl_insecure=args.ssl_insecure,
+++            )
++         )
++-    )
+++    except KeyboardInterrupt:
+++        pass  # shutdown handled inside run_proxy; suppress traceback
++-- 
++2.43.0
++
+diff --git a/proxy/modules/passive_scanner.py b/proxy/modules/passive_scanner.py
+index 3302740..3562d13 100644
+--- a/proxy/modules/passive_scanner.py
++++ b/proxy/modules/passive_scanner.py
+@@ -58,7 +58,7 @@ _SECRET_PARAMS: set[str] = {
+ }
+ 
+ # Regex that matches values looking like real secrets (length >= 8)
+-_SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_\-\.]{8,}")
++_SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_\-\.@!#$%^&*]{8,}")
+ 
+ # Path prefixes considered sensitive for auth checks
+ _SENSITIVE_PATHS: tuple[str, ...] = (
+@@ -204,7 +204,7 @@ def _check_secret_in_url(req: ProxyRequest) -> list[Finding]:
+                     request_id=req.id,
+                     evidence={
+                         "parameter": name,
+-                        "value_preview": value[:6] + "..." if len(value) > 6 else value,
++                        "value_preview": value[:6] + "…" if len(value) > 6 else value,
+                         "url": req.url,
+                     },
+                 ))
+-- 
+2.43.0
+

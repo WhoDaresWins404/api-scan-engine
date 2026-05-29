@@ -58,7 +58,8 @@ async def run_proxy(
     # Late import so callers that don't use SQLiteStore can skip it
     from proxy.core.store import SQLiteStore
     from proxy.modules.endpoint_mapper import EndpointMapper
-    from proxy.brain.generator import generate
+    from proxy.modules.passive_scanner import PassiveScanner
+    from proxy.brain.generator import generate, brain_loop
     from proxy.brain.journal import Journal
 
     store = SQLiteStore(db_path)
@@ -69,6 +70,7 @@ async def run_proxy(
 
     modules = [
         EndpointMapper(store),
+        PassiveScanner(store),
         *extra_modules,
     ]
 
@@ -83,11 +85,21 @@ async def run_proxy(
     master.addons.add(addon)
 
     log.info("Starting proxy on %s:%d  (db=%s)", host, port, db_path)
+    brain_task = asyncio.get_event_loop().create_task(
+        brain_loop(db_path),
+        name="brain-loop",
+    )
     try:
         await master.run()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down…")
     finally:
+        brain_task.cancel()
+        # Wait briefly for brain_task to cancel cleanly
+        try:
+            await asyncio.wait_for(asyncio.shield(brain_task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
         master.shutdown()
         store.close()
         journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
@@ -123,11 +135,14 @@ if __name__ == "__main__":
         format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    asyncio.run(
-        run_proxy(
-            host=args.host,
-            port=args.port,
-            db_path=args.db,
-            ssl_insecure=args.ssl_insecure,
+    try:
+        asyncio.run(
+            run_proxy(
+                host=args.host,
+                port=args.port,
+                db_path=args.db,
+                ssl_insecure=args.ssl_insecure,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        pass  # shutdown handled inside run_proxy; suppress traceback

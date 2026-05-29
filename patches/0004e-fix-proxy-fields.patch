@@ -1,0 +1,35 @@
+From 8fce0e62b8b76f1b2a84ee4d47dce1cd2cbe1e71 Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Fri, 29 May 2026 09:36:55 +0000
+Subject: [PATCH] session-004e: restore method and status_code fields in
+ _flow_to_request/_flow_to_response
+
+Fields were dropped during the utcnow patch in session-004d.
+Fixes 12 failing tests in test_proxy.py.
+---
+ proxy/core/proxy.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/proxy/core/proxy.py b/proxy/core/proxy.py
+index 137bd3b..a55627d 100644
+--- a/proxy/core/proxy.py
++++ b/proxy/core/proxy.py
+@@ -185,6 +185,7 @@ def _flow_to_request(flow: http.HTTPFlow) -> ProxyRequest:
+     return ProxyRequest(
+         id=str(uuid.uuid4()),
+         timestamp=datetime.now(timezone.utc),
++        method=mf.method,
+         url=mf.pretty_url,
+         headers=dict(mf.headers),
+         body=mf.content or None,
+@@ -196,6 +197,7 @@ def _flow_to_response(request_id: str, flow: http.HTTPFlow) -> ProxyResponse:
+     return ProxyResponse(
+         request_id=request_id,
+         timestamp=datetime.now(timezone.utc),
++        status_code=mresp.status_code,
+         headers=dict(mresp.headers),
+         body=mresp.content or None,
+     )
+-- 
+2.43.0
+

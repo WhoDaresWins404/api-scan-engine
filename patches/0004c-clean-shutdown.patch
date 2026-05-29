@@ -1,0 +1,65 @@
+From 60ce59f5090c22f8510316179cfbececee59c335 Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Fri, 29 May 2026 09:22:15 +0000
+Subject: [PATCH] =?UTF-8?q?session-004c:=20clean=20proxy=20shutdown=20?=
+ =?UTF-8?q?=E2=80=94=20catch=20CancelledError,=20suppress=20KeyboardInterr?=
+ =?UTF-8?q?upt=20traceback?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- run_proxy: catch CancelledError alongside KeyboardInterrupt so mitmproxy's
+  internal cancellation doesn't bypass the finally block
+- finally: wait up to 1s for brain_task to cancel before proceeding
+- __main__: wrap asyncio.run in try/except KeyboardInterrupt to suppress
+  the cosmetic traceback after shutdown completes successfully
+---
+ proxy/core/runner.py | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/proxy/core/runner.py b/proxy/core/runner.py
+index 9eec802..30e059b 100644
+--- a/proxy/core/runner.py
++++ b/proxy/core/runner.py
+@@ -91,10 +91,15 @@ async def run_proxy(
+     )
+     try:
+         await master.run()
+-    except KeyboardInterrupt:
++    except (KeyboardInterrupt, asyncio.CancelledError):
+         log.info("Shutting down…")
+     finally:
+         brain_task.cancel()
++        # Wait briefly for brain_task to cancel cleanly
++        try:
++            await asyncio.wait_for(asyncio.shield(brain_task), timeout=1.0)
++        except (asyncio.CancelledError, asyncio.TimeoutError):
++            pass
+         master.shutdown()
+         store.close()
+         journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
+@@ -130,11 +135,14 @@ if __name__ == "__main__":
+         format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
+         datefmt="%H:%M:%S",
+     )
+-    asyncio.run(
+-        run_proxy(
+-            host=args.host,
+-            port=args.port,
+-            db_path=args.db,
+-            ssl_insecure=args.ssl_insecure,
++    try:
++        asyncio.run(
++            run_proxy(
++                host=args.host,
++                port=args.port,
++                db_path=args.db,
++                ssl_insecure=args.ssl_insecure,
++            )
+         )
+-    )
++    except KeyboardInterrupt:
++        pass  # shutdown handled inside run_proxy; suppress traceback
+-- 
+2.43.0
+

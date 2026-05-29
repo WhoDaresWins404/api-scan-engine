@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from mitmproxy import http
@@ -184,7 +184,7 @@ def _flow_to_request(flow: http.HTTPFlow) -> ProxyRequest:
     mf = flow.request
     return ProxyRequest(
         id=str(uuid.uuid4()),
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         method=mf.method,
         url=mf.pretty_url,
         headers=dict(mf.headers),
@@ -196,7 +196,7 @@ def _flow_to_response(request_id: str, flow: http.HTTPFlow) -> ProxyResponse:
     mresp = flow.response
     return ProxyResponse(
         request_id=request_id,
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         status_code=mresp.status_code,
         headers=dict(mresp.headers),
         body=mresp.content or None,

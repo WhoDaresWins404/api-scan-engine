@@ -1,0 +1,340 @@
+From 56044f133e15b5e60736974305fefa6165a49994 Mon Sep 17 00:00:00 2001
+From: Dev <dev@example.com>
+Date: Fri, 29 May 2026 09:05:43 +0000
+Subject: [PATCH] session-004b: PassiveScanner deduplication (24h window, per
+ host+title)
+
+- passive_scanner.py v0.2.0
+  _dedup() filters findings by (title, host) within DEDUP_WINDOW_SECONDS (86400)
+  flush_dedup_cache() for testing/manual resets
+  healthcheck() now reports active dedup key count
+- tests: 5 new dedup tests (suppress, different hosts, window expiry, flush, zero window)
+---
+ proxy/modules/passive_scanner.py | 116 ++++++++++++++++++++++---------
+ tests/test_passive_scanner.py    |  83 ++++++++++++++++++++++
+ 2 files changed, 167 insertions(+), 32 deletions(-)
+
+diff --git a/proxy/modules/passive_scanner.py b/proxy/modules/passive_scanner.py
+index 44baf5d..3302740 100644
+--- a/proxy/modules/passive_scanner.py
++++ b/proxy/modules/passive_scanner.py
+@@ -6,18 +6,30 @@ Passive scanner — never modifies traffic, only observes.
+ Detections
+ ──────────
+   on_request:
+-    • Sensitive data in URL query string (tokens, passwords, API keys)
+-    • Sensitive path accessed without an Authorization header
++    * Sensitive data in URL query string (tokens, passwords, API keys)
++    * Sensitive path accessed without an Authorization header
+ 
+   on_response:
+-    • Missing security headers (HSTS, CSP, X-Frame-Options,
++    * Missing security headers (HSTS, CSP, X-Frame-Options,
+       X-Content-Type-Options, Permissions-Policy)
+-    • Server version disclosure via Server / X-Powered-By headers
++    * Server version disclosure via Server / X-Powered-By headers
++
++Deduplication
++─────────────
++  Findings are deduplicated by (title, host) within a rolling time
++  window (default DEDUP_WINDOW_SECONDS = 86400, i.e. 24 hours).
++  The first occurrence is written to the store; subsequent identical
++  findings are dropped until the window expires, at which point the
++  finding is re-recorded to capture any changes.
++
++  The dedup cache is in-process only (a plain dict) so it resets on
++  proxy restart — intentional, since a restart is a natural boundary
++  for re-checking known issues.
+ """
+ from __future__ import annotations
+ 
+ import re
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from urllib.parse import parse_qs, urlparse
+ 
+ from proxy.core.interfaces import (
+@@ -31,6 +43,9 @@ from proxy.core.interfaces import (
+ 
+ # ── tunables ──────────────────────────────────────────────────────
+ 
++# Suppress duplicate (title, host) findings within this window
++DEDUP_WINDOW_SECONDS: int = 86_400      # 24 hours
++
+ # Query-string parameter names that should never appear in a URL
+ _SECRET_PARAMS: set[str] = {
+     "token", "access_token", "refresh_token", "id_token",
+@@ -42,8 +57,7 @@ _SECRET_PARAMS: set[str] = {
+     "jwt",
+ }
+ 
+-# Regex that matches values looking like real secrets (length >= 8,
+-# mix of chars) — avoids flagging ?password=  or ?token=demo
++# Regex that matches values looking like real secrets (length >= 8)
+ _SECRET_VALUE_RE = re.compile(r"[A-Za-z0-9+/=_\-\.]{8,}")
+ 
+ # Path prefixes considered sensitive for auth checks
+@@ -56,11 +70,10 @@ _SENSITIVE_PATHS: tuple[str, ...] = (
+     "/auth/", "/oauth/",
+ )
+ 
+-# Methods that carry a body — GET/HEAD/OPTIONS on sensitive paths
+-# are less interesting for auth checks
++# Methods checked for missing auth headers
+ _AUTH_CHECK_METHODS: set[str] = {"POST", "PUT", "PATCH", "DELETE", "GET"}
+ 
+-# Security response headers: name → (severity, description)
++# Security response headers: name -> (severity, description)
+ _SECURITY_HEADERS: dict[str, tuple[str, str]] = {
+     "strict-transport-security": (
+         "medium",
+@@ -95,10 +108,17 @@ _DISCLOSURE_HEADERS: tuple[str, ...] = (
+ 
+ class PassiveScanner:
+     name = "passive_scanner"
+-    version = "0.1.0"
++    version = "0.2.0"
+ 
+-    def __init__(self, store: IStore) -> None:
++    def __init__(
++        self,
++        store: IStore,
++        dedup_window_seconds: int = DEDUP_WINDOW_SECONDS,
++    ) -> None:
+         self._store = store
++        self._dedup_window = timedelta(seconds=dedup_window_seconds)
++        # cache: (title, host) -> datetime of first-seen in current window
++        self._seen: dict[tuple[str, str], datetime] = {}
+ 
+     # ── IModule ───────────────────────────────────────────────────
+ 
+@@ -106,20 +126,17 @@ class PassiveScanner:
+         findings: list[Finding] = []
+         findings.extend(_check_secret_in_url(req))
+         findings.extend(_check_unauthed_sensitive_path(req))
+-        return findings
++        return self._dedup(findings)
+ 
+     async def on_response(
+         self, req: ProxyRequest, resp: ProxyResponse
+     ) -> list[Finding]:
+         findings: list[Finding] = []
+-
+-        # Only check HTML/JSON/API responses — skip images, fonts, etc.
+         ct = resp.headers.get("content-type", "").lower()
+         if _is_checkable_content_type(ct):
+             findings.extend(_check_security_headers(req, resp))
+             findings.extend(_check_version_disclosure(req, resp))
+-
+-        return findings
++        return self._dedup(findings)
+ 
+     async def healthcheck(self) -> ModuleHealth:
+         count = len(await self._store.query("findings", {"module_name": self.name}))
+@@ -128,9 +145,39 @@ class PassiveScanner:
+             version=self.version,
+             status="ok",
+             last_seen=datetime.now(timezone.utc),
+-            detail=f"{count} finding(s) logged",
++            detail=(
++                f"{count} finding(s) in store, "
++                f"{len(self._seen)} active dedup key(s)"
++            ),
+         )
+ 
++    # ── deduplication ─────────────────────────────────────────────
++
++    def _dedup(self, findings: list[Finding]) -> list[Finding]:
++        """
++        Filter findings to suppress duplicates within the rolling window.
++
++        Key: (finding.title, host extracted from finding.evidence['url'])
++        A finding passes through if:
++          - its key has never been seen, OR
++          - the window for its key has expired
++        On pass-through the key's timestamp is reset to now.
++        """
++        now = datetime.now(timezone.utc)
++        out: list[Finding] = []
++        for f in findings:
++            host = _host_from_evidence(f)
++            key = (f.title, host)
++            last_seen = self._seen.get(key)
++            if last_seen is None or (now - last_seen) >= self._dedup_window:
++                self._seen[key] = now
++                out.append(f)
++        return out
++
++    def flush_dedup_cache(self) -> None:
++        """Clear the dedup cache — useful for testing or manual resets."""
++        self._seen.clear()
++
+ 
+ # ── detection functions (pure — no I/O, easy to unit-test) ───────
+ 
+@@ -150,13 +197,14 @@ def _check_secret_in_url(req: ProxyRequest) -> list[Finding]:
+                     severity="high",
+                     title="Sensitive data in URL",
+                     description=(
+-                        f"Query parameter '{name}' looks like a secret and is exposed "
+-                        f"in the URL. URLs are logged by proxies, servers, and browsers."
++                        f"Query parameter '{name}' looks like a secret and is "
++                        f"exposed in the URL. URLs are logged by proxies, servers, "
++                        f"and browsers."
+                     ),
+                     request_id=req.id,
+                     evidence={
+                         "parameter": name,
+-                        "value_preview": value[:6] + "…" if len(value) > 6 else value,
++                        "value_preview": value[:6] + "..." if len(value) > 6 else value,
+                         "url": req.url,
+                     },
+                 ))
+@@ -177,7 +225,7 @@ def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
+     has_auth = (
+         "authorization" in headers_lower
+         or "x-api-key" in headers_lower
+-        or "cookie" in headers_lower       # session cookies count
++        or "cookie" in headers_lower
+     )
+     if has_auth:
+         return []
+@@ -198,7 +246,6 @@ def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
+ def _check_security_headers(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+     findings = []
+     headers_lower = {k.lower() for k in resp.headers}
+-
+     for header, (severity, description) in _SECURITY_HEADERS.items():
+         if header not in headers_lower:
+             findings.append(Finding(
+@@ -215,13 +262,11 @@ def _check_security_headers(req: ProxyRequest, resp: ProxyResponse) -> list[Find
+ def _check_version_disclosure(req: ProxyRequest, resp: ProxyResponse) -> list[Finding]:
+     findings = []
+     for header in _DISCLOSURE_HEADERS:
+-        value = resp.headers.get(header, "")
+-        if not value:
+-            # Try case-insensitive lookup
+-            for k, v in resp.headers.items():
+-                if k.lower() == header:
+-                    value = v
+-                    break
++        value = ""
++        for k, v in resp.headers.items():
++            if k.lower() == header:
++                value = v
++                break
+         if value:
+             findings.append(Finding(
+                 module_name="passive_scanner",
+@@ -238,8 +283,15 @@ def _check_version_disclosure(req: ProxyRequest, resp: ProxyResponse) -> list[Fi
+ 
+ 
+ def _is_checkable_content_type(ct: str) -> bool:
+-    """Return True for content types worth checking security headers on."""
+     return any(t in ct for t in (
+         "text/html", "application/json", "application/xml",
+         "text/xml", "text/plain", "application/javascript",
+-    )) or ct == ""   # no content-type is itself suspicious
++    )) or ct == ""
++
++
++def _host_from_evidence(finding: Finding) -> str:
++    """Extract hostname from finding evidence URL, fall back to empty string."""
++    url = finding.evidence.get("url", "")
++    if url:
++        return urlparse(url).netloc
++    return ""
+diff --git a/tests/test_passive_scanner.py b/tests/test_passive_scanner.py
+index cb77335..9f2f94b 100644
+--- a/tests/test_passive_scanner.py
++++ b/tests/test_passive_scanner.py
+@@ -322,3 +322,86 @@ async def test_healthcheck_returns_ok():
+     health = await scanner.healthcheck()
+     assert health.status == "ok"
+     assert health.module_name == "passive_scanner"
++
++
++# ─────────────────────────────────────────────────────────────────
++#  Deduplication
++# ─────────────────────────────────────────────────────────────────
++
++def test_dedup_suppresses_duplicate_within_window():
++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
++    req = _req()
++    resp = _resp(headers={"content-type": "text/html"})
++
++    findings1 = _check_security_headers(req, resp)
++    findings2 = _check_security_headers(req, resp)
++
++    # First pass — all findings through
++    out1 = scanner._dedup(findings1)
++    assert len(out1) == 5
++
++    # Second pass same host+title — all suppressed
++    out2 = scanner._dedup(findings2)
++    assert out2 == []
++
++
++def test_dedup_allows_different_hosts():
++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
++
++    req_a = _req(url="https://site-a.example.com/page")
++    req_b = _req(url="https://site-b.example.com/page")
++    resp = _resp(headers={"content-type": "text/html"})
++
++    out_a = scanner._dedup(_check_security_headers(req_a, resp))
++    out_b = scanner._dedup(_check_security_headers(req_b, resp))
++
++    # Different hosts — both sets should pass through
++    assert len(out_a) == 5
++    assert len(out_b) == 5
++
++
++def test_dedup_resets_after_window_expires():
++    from datetime import timedelta
++
++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=1)
++    req = _req()
++    resp = _resp(headers={"content-type": "text/html"})
++
++    findings = _check_security_headers(req, resp)
++
++    out1 = scanner._dedup(findings)
++    assert len(out1) == 5
++
++    # Manually expire the cache by backdating all entries
++    expired = datetime.now(timezone.utc) - timedelta(seconds=2)
++    for key in scanner._seen:
++        scanner._seen[key] = expired
++
++    out2 = scanner._dedup(findings)
++    assert len(out2) == 5   # window expired — all pass through again
++
++
++def test_dedup_flush_clears_cache():
++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=3600)
++    req = _req()
++    resp = _resp(headers={"content-type": "text/html"})
++
++    findings = _check_security_headers(req, resp)
++    scanner._dedup(findings)
++    assert len(scanner._seen) > 0
++
++    scanner.flush_dedup_cache()
++    assert scanner._seen == {}
++
++
++def test_dedup_window_zero_never_suppresses():
++    scanner = PassiveScanner(FakeStore(), dedup_window_seconds=0)
++    req = _req()
++    resp = _resp(headers={"content-type": "text/html"})
++    findings = _check_security_headers(req, resp)
++
++    out1 = scanner._dedup(findings)
++    out2 = scanner._dedup(findings)
++    # window=0 means every finding is always "expired"
++    assert len(out1) == 5
++    assert len(out2) == 5
+-- 
+2.43.0
+
