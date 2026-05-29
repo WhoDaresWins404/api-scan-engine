@@ -21,10 +21,10 @@ log = logging.getLogger("scan.brain")
 
 BRAIN_INTERVAL = 600        # regenerate every 10 minutes
 BRAIN_PATH = Path(__file__).parent.parent.parent / "PROJECT_BRAIN.md"
+STATUS_PATH = Path(__file__).parent.parent.parent / "SCAN_STATUS.md"
 
-TEMPLATE = """\
-# PROJECT_BRAIN — API Scan Engine
-_Auto-generated: {generated_at}_
+BRAIN_TEMPLATE = """# PROJECT_BRAIN — API Scan Engine
+_Last updated: {generated_at}_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
@@ -49,47 +49,68 @@ proxy/
     interfaces.py       # IModule, IStore, shared dataclasses
     store.py            # SQLiteStore — concrete IStore implementation
     proxy.py            # ScanAddon (mitmproxy addon)
-    runner.py           # CLI launcher — wires store, journal, generator
+    runner.py           # CLI launcher — wires store, journal, generator, brain_loop
   modules/
     endpoint_mapper.py  # discovers unique host+path+method combinations (v0.2.0)
+    passive_scanner.py  # passive security checks (v0.2.0)
   brain/
-    generator.py        # regenerates this file — every 10 min + on shutdown
-    journal.py          # append-only session event log (scan.journal.jsonl)
+    generator.py        # writes PROJECT_BRAIN.md (session doc) + SCAN_STATUS.md (traffic data)
+    journal.py          # append-only JSONL event log (scan.journal.jsonl)
 conftest.py             # pytest sys.path fix
 pyproject.toml          # packaging + pytest config (asyncio_mode=auto)
 patches/                # numbered .patch files from each session
 tests/
-  test_proxy.py         # 16 tests, all passing
+  test_proxy.py         # 16 tests — ScanAddon pipeline
+  test_passive_scanner.py  # 35 tests — PassiveScanner + dedup
 
 ## Current state
-- [x] Project skeleton — interfaces, store, journal, apply helper
-- [x] SQLiteStore — write, read, query, pub/sub verified
-- [x] EndpointMapper module — verified (v0.2.0, emits Finding on discovery)
-- [x] BrainGenerator — every 10 min + on shutdown, wired to runner.py
-- [x] Journal — wired to runner.py start/stop events
-- [x] mitmproxy integration — proxy/core/proxy.py + runner.py complete
-- [x] 16 tests passing (pytest tests/ -v), 0 warnings
-- [x] VirtualBox VM deployment — 192.168.50.221, DHCP reserved lease
-- [x] CA cert distributed — TLS interception working subnet-wide
-- [ ] PassiveScanner module — not started
+- [x] Project skeleton, SQLiteStore, EndpointMapper, BrainGenerator, Journal
+- [x] mitmproxy integration — ScanAddon + runner.py
+- [x] PassiveScanner v0.2.0 — 5 detection categories, 24h dedup
+- [x] Clean proxy shutdown — CancelledError handled, no traceback
+- [x] 51 tests passing, 0 warnings
+- [x] VirtualBox VM — 192.168.50.221, DHCP reserved, VS Code Remote-SSH
+- [x] CA cert deployed — TLS interception working subnet-wide
 - [ ] FindingReporter module — not started
+- [ ] SQLiteStore vacuum — not started
+
+## Traffic summary (see SCAN_STATUS.md for full details)
+- Endpoints discovered: {endpoint_count}
+- Findings logged:      {finding_count}
+
+## Hard-won operational notes
+- fix-perms after any manual file copy:
+  sudo chown -R lab:lab ~/api-scan-engine && find ~/api-scan-engine -name "*.py" -exec chmod 644 {{}} \\\\;
+- Prefer git checkout HEAD -- <file> over SCP to restore files
+- After any patch touching dataclass constructors verify all required fields:
+  grep "ProxyRequest|ProxyResponse" proxy/core/proxy.py
+- Proxy start: python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db
+- Manual regen: python -m proxy.brain.generator --db scan.db
+- PROJECT_BRAIN.md = lean session handoff (~6KB). SCAN_STATUS.md = live traffic data.
+
+## Last journal entries
+{journal_section}
+
+## Next session goal
+- FindingReporter module (proxy/modules/finding_reporter.py)
+  Output: console (coloured), JSON file, CSV file; configurable severity threshold
+- SQLiteStore vacuum(max_age_days) — weekly background task to bound scan.db size
+- Wire FindingReporter into runner.py; add tests/test_finding_reporter.py
+"""
+
+STATUS_TEMPLATE = """# SCAN_STATUS — API Scan Engine
+_Auto-generated: {generated_at} — do NOT paste into chat sessions_
+_For session handoff use PROJECT_BRAIN.md instead_
+
+## Summary
+- Endpoints discovered: {endpoint_count}
+- Findings logged:      {finding_count}
 
 ## Discovered endpoints ({endpoint_count} total)
 {endpoints_section}
 
 ## Findings ({finding_count} total)
 {findings_section}
-
-## Last session journal
-{journal_section}
-
-## Next session goal
-- Implement PassiveScanner module (proxy/modules/passive_scanner.py)
-  Detections: missing security headers (CSP, HSTS, X-Frame-Options),
-  sensitive data in URLs (tokens/passwords in query strings),
-  unauthenticated endpoints on sensitive paths
-- Wire PassiveScanner into runner.py alongside EndpointMapper
-- Add tests/test_passive_scanner.py
 """
 
 
@@ -149,18 +170,29 @@ async def generate(db_path: str) -> None:
     else:
         journal_section = "_No entries yet._"
 
-    content = TEMPLATE.format(
-        generated_at      = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # PROJECT_BRAIN.md — lean session handoff doc (counts only, no raw lists)
+    brain_content = BRAIN_TEMPLATE.format(
+        generated_at   = now_str,
+        endpoint_count = len(endpoints),
+        finding_count  = len(findings),
+        journal_section = journal_section,
+    )
+    BRAIN_PATH.write_text(brain_content)
+
+    # SCAN_STATUS.md — full traffic data (never paste into chat)
+    status_content = STATUS_TEMPLATE.format(
+        generated_at      = now_str,
         endpoint_count    = len(endpoints),
         finding_count     = len(findings),
         endpoints_section = endpoints_section,
         findings_section  = findings_section,
-        journal_section   = journal_section,
     )
+    STATUS_PATH.write_text(status_content)
 
-    BRAIN_PATH.write_text(content)
     log.info(
-        "PROJECT_BRAIN.md updated  (%d endpoints, %d findings)",
+        "PROJECT_BRAIN.md + SCAN_STATUS.md updated  (%d endpoints, %d findings)",
         len(endpoints), len(findings),
     )
 
