@@ -44,6 +44,10 @@ async def run_proxy(
     db_path: str = "scan.db",
     extra_modules: list = (),
     ssl_insecure: bool = False,
+    min_severity: str = "info",
+    report_console: bool = True,
+    report_json: str | None = "findings.ndjson",
+    report_csv: str | None = "findings.csv",
 ) -> None:
     """
     Boot mitmproxy with ScanAddon.
@@ -59,6 +63,7 @@ async def run_proxy(
     from proxy.core.store import SQLiteStore
     from proxy.modules.endpoint_mapper import EndpointMapper
     from proxy.modules.passive_scanner import PassiveScanner
+    from proxy.modules.finding_reporter import FindingReporter
     from proxy.brain.generator import generate, brain_loop
     from proxy.brain.journal import Journal
 
@@ -67,6 +72,15 @@ async def run_proxy(
 
     journal = Journal(db_path)
     journal.log("proxy", f"started on {host}:{port}")
+
+    reporter = FindingReporter(
+        store,
+        min_severity=min_severity,
+        console=report_console,
+        json_path=report_json,
+        csv_path=report_csv,
+    )
+    await reporter.start()
 
     modules = [
         EndpointMapper(store),
@@ -101,6 +115,7 @@ async def run_proxy(
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
         master.shutdown()
+        await reporter.stop()
         store.close()
         journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
         await generate(db_path)
