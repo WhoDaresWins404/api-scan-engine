@@ -139,6 +139,9 @@ class SQLiteStore(IStore):
             (cutoff,),
         )
         deleted = cursor.rowcount
-        self._conn.execute("VACUUM")
         self._conn.commit()
+        # VACUUM must run outside any transaction — use isolation_level=None
+        self._conn.isolation_level = None
+        self._conn.execute("VACUUM")
+        self._conn.isolation_level = ""   # restore default (deferred)
         return deleted
