@@ -5,30 +5,19 @@ Programmatic launcher for the scan proxy.
 
 Usage (CLI)
 ───────────
-    python -m proxy.core.runner --host 127.0.0.1 --port 8080 --db scan.db
+    python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db
+    python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db \
+        --min-severity medium
 
 Usage (library)
 ───────────────
-    from proxy.core.runner import run_proxy
-    from proxy.modules.endpoint_mapper import EndpointMapper
-    from proxy.core.store import SQLiteStore
-
-    asyncio.run(
-        run_proxy(
-            host="127.0.0.1",
-            port=8080,
-            db_path="scan.db",
-            extra_modules=[],
-        )
-    )
+    asyncio.run(run_proxy(host="0.0.0.0", port=8080, db_path="scan.db"))
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
-import sys
-from typing import Sequence
 
 from mitmproxy import options
 from mitmproxy.tools.dump import DumpMaster
@@ -36,6 +25,8 @@ from mitmproxy.tools.dump import DumpMaster
 from proxy.core.proxy import ScanAddon
 
 log = logging.getLogger("scan.runner")
+
+VACUUM_INTERVAL = 7 * 24 * 3600   # weekly, in seconds
 
 
 async def run_proxy(
@@ -49,17 +40,6 @@ async def run_proxy(
     report_json: str | None = "findings.ndjson",
     report_csv: str | None = "findings.csv",
 ) -> None:
-    """
-    Boot mitmproxy with ScanAddon.
-
-    Parameters
-    ----------
-    host, port      : listen address for the proxy
-    db_path         : path for SQLiteStore
-    extra_modules   : additional IModule instances beyond the defaults
-    ssl_insecure    : pass --ssl-insecure (useful for testing)
-    """
-    # Late import so callers that don't use SQLiteStore can skip it
     from proxy.core.store import SQLiteStore
     from proxy.modules.endpoint_mapper import EndpointMapper
     from proxy.modules.passive_scanner import PassiveScanner
@@ -73,6 +53,8 @@ async def run_proxy(
     journal = Journal(db_path)
     journal.log("proxy", f"started on {host}:{port}")
 
+    # FindingReporter wired as IModule so ScanAddon calls on_request/on_response
+    # AND as a subscriber via reporter.start() for real-time pub/sub output
     reporter = FindingReporter(
         store,
         min_severity=min_severity,
@@ -85,6 +67,7 @@ async def run_proxy(
     modules = [
         EndpointMapper(store),
         PassiveScanner(store),
+        reporter,            # wired as IModule — healthcheck included in sweep
         *extra_modules,
     ]
 
@@ -99,27 +82,43 @@ async def run_proxy(
     master.addons.add(addon)
 
     log.info("Starting proxy on %s:%d  (db=%s)", host, port, db_path)
+
     brain_task = asyncio.get_event_loop().create_task(
-        brain_loop(db_path),
-        name="brain-loop",
+        brain_loop(db_path), name="brain-loop"
     )
+    vacuum_task = asyncio.get_event_loop().create_task(
+        _vacuum_loop(store), name="vacuum-loop"
+    )
+
     try:
         await master.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutting down…")
     finally:
         brain_task.cancel()
-        # Wait briefly for brain_task to cancel cleanly
-        try:
-            await asyncio.wait_for(asyncio.shield(brain_task), timeout=1.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+        vacuum_task.cancel()
+        for t in (brain_task, vacuum_task):
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         master.shutdown()
         await reporter.stop()
         store.close()
         journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
         await generate(db_path)
         log.info("PROJECT_BRAIN.md updated")
+
+
+async def _vacuum_loop(store) -> None:
+    """Background task: vacuum old records weekly."""
+    while True:
+        await asyncio.sleep(VACUUM_INTERVAL)
+        try:
+            deleted = store.vacuum(max_age_days=30)
+            log.info("Vacuum complete — %d record(s) deleted", deleted)
+        except Exception as exc:
+            log.error("Vacuum failed: %s", exc)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -131,13 +130,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8080, help="Listen port")
     p.add_argument("--db", default="scan.db", help="SQLite database path")
     p.add_argument(
-        "--ssl-insecure",
-        action="store_true",
+        "--ssl-insecure", action="store_true",
         help="Disable upstream TLS verification",
     )
     p.add_argument(
-        "--log-level",
-        default="INFO",
+        "--min-severity", default="info",
+        choices=["info", "low", "medium", "high", "critical"],
+        help="Minimum severity level to report",
+    )
+    p.add_argument(
+        "--no-console", action="store_true",
+        help="Suppress console finding output",
+    )
+    p.add_argument(
+        "--report-json", default="findings.ndjson",
+        help="Path for JSON findings output (empty string to disable)",
+    )
+    p.add_argument(
+        "--report-csv", default="findings.csv",
+        help="Path for CSV findings output (empty string to disable)",
+    )
+    p.add_argument(
+        "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     return p
@@ -157,6 +171,10 @@ if __name__ == "__main__":
                 port=args.port,
                 db_path=args.db,
                 ssl_insecure=args.ssl_insecure,
+                min_severity=args.min_severity,
+                report_console=not args.no_console,
+                report_json=args.report_json or None,
+                report_csv=args.report_csv or None,
             )
         )
     except KeyboardInterrupt:

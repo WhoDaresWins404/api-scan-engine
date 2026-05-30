@@ -9,7 +9,7 @@ import json
 import sqlite3
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +17,9 @@ from proxy.core.interfaces import IStore
 
 
 DB_PATH = Path(__file__).parent.parent.parent / "scan_engine.db"
+
+# How often the vacuum background task runs (seconds)
+VACUUM_INTERVAL = 7 * 24 * 3600   # once a week
 
 
 class SQLiteStore(IStore):
@@ -106,11 +109,36 @@ class SQLiteStore(IStore):
         self._subscribers[event_type].append(callback)
 
     async def publish(self, event_type: str, payload: dict) -> None:
-            for callback in self._subscribers.get(event_type, []):
-                try:
-                    if asyncio.iscoroutinefunction(callback):
-                        await callback(payload)
-                    else:
-                        callback(payload)
-                except Exception:
-                    pass  # subscribers must never crash the publisher
+        for callback in self._subscribers.get(event_type, []):
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(payload)
+                else:
+                    callback(payload)
+            except Exception:
+                pass  # subscribers must never crash the publisher
+
+    # ------------------------------------------------------------------
+    # Maintenance
+    # ------------------------------------------------------------------
+
+    def vacuum(self, max_age_days: int = 30) -> int:
+        """
+        Delete records older than max_age_days from all collections
+        EXCEPT 'endpoints' (we want to keep the full discovered map).
+
+        Returns the number of rows deleted.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        ).isoformat()
+
+        cursor = self._conn.execute(
+            "DELETE FROM records "
+            "WHERE collection != 'endpoints' AND created_at < ?",
+            (cutoff,),
+        )
+        deleted = cursor.rowcount
+        self._conn.execute("VACUUM")
+        self._conn.commit()
+        return deleted
