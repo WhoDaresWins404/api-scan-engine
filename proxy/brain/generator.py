@@ -32,8 +32,8 @@ _Paste this file at the start of every new session._
 - Module model: in-process, IModule interface enforced
 - Store: SQLite (Phase 1) → PostgreSQL (Phase 2), IStore abstraction
 - Protocols: HTTP/HTTPS (Phase 1) → GraphQL/WS (Phase 2) → gRPC (Phase 3)
-- Delta patch workflow: git apply / python apply.py for all code changes
-- Lab environment: VirtualBox Ubuntu VM (192.168.50.221), VS Code Remote-SSH
+- Workflow: PC1 (Windows/VS Code) -> GitHub -> PC2 (Ubuntu VM git pull)
+- Lab environment: VirtualBox Ubuntu VM (192.168.50.221), DHCP reserved
 
 ## Core interfaces (proxy/core/interfaces.py)
 - ProxyRequest: id, timestamp, method, url, headers, body
@@ -47,55 +47,71 @@ _Paste this file at the start of every new session._
 proxy/
   core/
     interfaces.py       # IModule, IStore, shared dataclasses
-    store.py            # SQLiteStore — concrete IStore implementation
+    store.py            # SQLiteStore + vacuum(max_age_days)
     proxy.py            # ScanAddon (mitmproxy addon)
-    runner.py           # CLI launcher — wires store, journal, generator, brain_loop
+    runner.py           # CLI launcher -- all modules + vacuum + brain_loop
   modules/
-    endpoint_mapper.py  # discovers unique host+path+method combinations (v0.2.0)
-    passive_scanner.py  # passive security checks (v0.2.0)
+    endpoint_mapper.py  # host+path+method discovery, asset filtering (v0.3.0)
+    passive_scanner.py  # passive security checks, 24h dedup (v0.2.0)
+    finding_reporter.py # real-time console/JSON/CSV output (v0.1.0)
   brain/
-    generator.py        # writes PROJECT_BRAIN.md (session doc) + SCAN_STATUS.md (traffic data)
-    journal.py          # append-only JSONL event log (scan.journal.jsonl)
+    generator.py        # PROJECT_BRAIN.md (lean) + SCAN_STATUS.md (traffic data)
+    journal.py          # append-only JSONL event log
 conftest.py             # pytest sys.path fix
 pyproject.toml          # packaging + pytest config (asyncio_mode=auto)
-patches/                # numbered .patch files from each session
+.gitignore              # PROJECT_BRAIN.md, SCAN_STATUS.md, scan.db, findings.* excluded
 tests/
-  test_proxy.py         # 16 tests — ScanAddon pipeline
-  test_passive_scanner.py  # 35 tests — PassiveScanner + dedup
+  test_proxy.py              # 16 tests
+  test_passive_scanner.py    # 35 tests
+  test_finding_reporter.py   # 16 tests
+  test_session006.py         # 20 tests
 
 ## Current state
-- [x] Project skeleton, SQLiteStore, EndpointMapper, BrainGenerator, Journal
-- [x] mitmproxy integration — ScanAddon + runner.py
-- [x] PassiveScanner v0.2.0 — 5 detection categories, 24h dedup
-- [x] Clean proxy shutdown — CancelledError handled, no traceback
-- [x] 51 tests passing, 0 warnings
-- [x] VirtualBox VM — 192.168.50.221, DHCP reserved, VS Code Remote-SSH
-- [x] CA cert deployed — TLS interception working subnet-wide
-- [ ] FindingReporter module — not started
-- [ ] SQLiteStore vacuum — not started
+- [x] Project skeleton, SQLiteStore, EndpointMapper, Journal, BrainGenerator
+- [x] mitmproxy integration -- ScanAddon + runner.py
+- [x] PassiveScanner v0.2.0 -- 5 detection categories, 24h dedup
+- [x] FindingReporter v0.1.0 -- console (ANSI colour), JSON, CSV, severity filter
+- [x] FindingReporter wired as IModule in runner.py modules list
+- [x] SQLiteStore.vacuum(max_age_days=30) -- weekly background task
+- [x] EndpointMapper v0.3.0 -- static asset filtering (JS/CSS/images/fonts/media)
+- [x] Clean proxy shutdown -- CancelledError handled, no traceback
+- [x] 87 tests passing, 0 warnings
+- [x] GitHub workflow -- credentials stored, no password prompts
+- [x] PROJECT_BRAIN.md in .gitignore -- no merge conflicts on git pull
+- [x] CA cert deployed -- TLS interception working subnet-wide
+
+## Module summary
+| Module          | Version | Role                                       |
+|-----------------|---------|--------------------------------------------|
+| EndpointMapper  | 0.3.0   | Discover API endpoints, skip static assets |
+| PassiveScanner  | 0.2.0   | Detect security issues, 24h dedup          |
+| FindingReporter | 0.1.0   | Real-time output -- console / JSON / CSV   |
 
 ## Traffic summary (see SCAN_STATUS.md for full details)
 - Endpoints discovered: {endpoint_count}
 - Findings logged:      {finding_count}
 
+## Proxy start commands
+  python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db
+  python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db --min-severity medium
+  python -m proxy.core.runner --help
+
 ## Hard-won operational notes
-- fix-perms after any manual file copy:
-  sudo chown -R lab:lab ~/api-scan-engine && find ~/api-scan-engine -name "*.py" -exec chmod 644 {{}} \\\\;
-- Prefer git checkout HEAD -- <file> over SCP to restore files
-- After any patch touching dataclass constructors verify all required fields:
-  grep "ProxyRequest|ProxyResponse" proxy/core/proxy.py
-- Proxy start: python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db
-- Manual regen: python -m proxy.brain.generator --db scan.db
-- PROJECT_BRAIN.md = lean session handoff (~6KB). SCAN_STATUS.md = live traffic data.
+- PROJECT_BRAIN.md is .gitignored -- generated locally, never tracked in git
+- SCAN_STATUS.md, findings.ndjson, findings.csv also .gitignored
+- After git pull: always run pytest tests/ -v before restarting proxy
+- Manual brain regen: python -m proxy.brain.generator --db scan.db
+- GitHub credentials: git config --global credential.helper store
+- SQLite VACUUM must run outside a transaction -- commit first, then
+  set isolation_level=None, VACUUM, restore isolation_level=""
 
 ## Last journal entries
 {journal_section}
 
 ## Next session goal
-- FindingReporter module (proxy/modules/finding_reporter.py)
-  Output: console (coloured), JSON file, CSV file; configurable severity threshold
-- SQLiteStore vacuum(max_age_days) — weekly background task to bound scan.db size
-- Wire FindingReporter into runner.py; add tests/test_finding_reporter.py
+- PassiveScanner host blocklist -- skip CDN/analytics/ad hosts to cut false positives
+- Review findings.csv quality after live browsing session
+- Consider GraphQL/WebSocket detection (Phase 2 prep)
 """
 
 STATUS_TEMPLATE = """# SCAN_STATUS — API Scan Engine

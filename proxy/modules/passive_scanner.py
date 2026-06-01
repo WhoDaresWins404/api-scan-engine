@@ -25,6 +25,14 @@ Deduplication
   The dedup cache is in-process only (a plain dict) so it resets on
   proxy restart — intentional, since a restart is a natural boundary
   for re-checking known issues.
+
+Host blocklist
+──────────────
+  CDN, analytics, ad-network, and telemetry hosts are blocked by
+  default — they generate hundreds of low-value findings (missing
+  CSP on a Google CDN is not actionable).  Add custom hosts via
+  PassiveScanner(store, extra_blocked_hosts={"mycdn.example.com"}).
+  Disable entirely with PassiveScanner(store, use_blocklist=False).
 """
 from __future__ import annotations
 
@@ -105,24 +113,100 @@ _DISCLOSURE_HEADERS: tuple[str, ...] = (
     "x-aspnetmvc-version",
 )
 
+# ── host blocklist ────────────────────────────────────────────────
+# Hosts where security findings are not actionable — CDNs, analytics,
+# ad networks, telemetry, browser infrastructure.
+# Matched by exact hostname OR suffix (e.g. ".googleapis.com" blocks
+# all subdomains of googleapis.com).
+_BLOCKED_HOST_SUFFIXES: frozenset[str] = frozenset({
+    # Google infrastructure
+    ".googleapis.com",
+    ".gstatic.com",
+    ".google.com",
+    ".google.de",
+    ".google.co.uk",
+    ".googletagmanager.com",
+    ".googleanalytics.com",
+    ".doubleclick.net",
+    ".googlesyndication.com",
+    # Microsoft / Bing
+    ".microsoft.com",
+    ".bing.com",
+    ".msecnd.net",
+    ".azure.com",
+    ".azureedge.net",
+    # CDN providers
+    ".cloudflare.com",
+    ".cloudfront.net",
+    ".fastly.net",
+    ".akamai.net",
+    ".akamaized.net",
+    ".akamaitechnologies.com",
+    ".edgesuite.net",
+    # Analytics & tracking
+    ".analytics.google.com",
+    ".segment.com",
+    ".mixpanel.com",
+    ".amplitude.com",
+    ".hotjar.com",
+    ".clarity.ms",
+    # Ad networks
+    ".doubleclick.net",
+    ".adnxs.com",
+    ".advertising.com",
+    ".moatads.com",
+    # Social / auth SDKs
+    ".facebook.com",
+    ".facebook.net",
+    ".twitter.com",
+    ".twimg.com",
+    # Browser telemetry
+    "detectportal.firefox.com",
+    "content-autofill.googleapis.com",
+    # Privacy management (consent popups)
+    ".privacy-mgmt.com",
+    ".cookielaw.org",
+    ".onetrust.com",
+})
+
 
 class PassiveScanner:
     name = "passive_scanner"
-    version = "0.2.0"
+    version = "0.3.0"
 
     def __init__(
         self,
         store: IStore,
         dedup_window_seconds: int = DEDUP_WINDOW_SECONDS,
+        use_blocklist: bool = True,
+        extra_blocked_hosts: set[str] | None = None,
     ) -> None:
         self._store = store
         self._dedup_window = timedelta(seconds=dedup_window_seconds)
-        # cache: (title, host) -> datetime of first-seen in current window
         self._seen: dict[tuple[str, str], datetime] = {}
+        self._use_blocklist = use_blocklist
+        self._blocked_suffixes = (
+            _BLOCKED_HOST_SUFFIXES | (extra_blocked_hosts or set())
+        )
+        self._blocked_count = 0   # for healthcheck reporting
+
+    def _is_blocked(self, host: str) -> bool:
+        """Return True if this host should be skipped."""
+        if not self._use_blocklist:
+            return False
+        host_lower = host.lower()
+        for suffix in self._blocked_suffixes:
+            if host_lower == suffix.lstrip(".") or host_lower.endswith(suffix):
+                return True
+        return False
 
     # ── IModule ───────────────────────────────────────────────────
 
     async def on_request(self, req: ProxyRequest) -> list[Finding]:
+        host = urlparse(req.url).netloc
+        if self._is_blocked(host):
+            self._blocked_count += 1
+            return []
         findings: list[Finding] = []
         findings.extend(_check_secret_in_url(req))
         findings.extend(_check_unauthed_sensitive_path(req))
@@ -131,6 +215,9 @@ class PassiveScanner:
     async def on_response(
         self, req: ProxyRequest, resp: ProxyResponse
     ) -> list[Finding]:
+        host = urlparse(req.url).netloc
+        if self._is_blocked(host):
+            return []
         findings: list[Finding] = []
         ct = resp.headers.get("content-type", "").lower()
         if _is_checkable_content_type(ct):
@@ -147,7 +234,8 @@ class PassiveScanner:
             last_seen=datetime.now(timezone.utc),
             detail=(
                 f"{count} finding(s) in store, "
-                f"{len(self._seen)} active dedup key(s)"
+                f"{len(self._seen)} active dedup key(s), "
+                f"{self._blocked_count} blocked host request(s)"
             ),
         )
 
