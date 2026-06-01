@@ -1,0 +1,221 @@
+import pandas as pd
+import numpy as np
+import os
+import re
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from tqdm.auto import tqdm
+
+# ==========================================
+# 1. FULL CONTEXT DATA CLEANER (No more hiding!)
+# ==========================================
+kaggle_path = "/kaggle/input/datasets/ispangler/csic-2010-web-application-attacks/csic_database.csv"
+path = kaggle_path if os.path.exists(kaggle_path) else "CSIC_2010.csv"
+
+print(f"📥 Loading raw CSIC 2010 data...")
+df_raw = pd.read_csv(path, engine='python', on_bad_lines='skip')
+
+def reconstruct_raw_http(df):
+    """Rebuilds the CSV columns into a raw HTTP string with \n separators."""
+    df.columns = [str(c).lower().strip().replace(' ', '_') for c in df.columns]
+    
+    # Find Label
+    label_col = next((col for col in df.columns if 'classification' in col or 'label' in col), df.columns[-1])
+    
+    def build_request(row):
+        method = str(row.get('method', 'GET')).strip()
+        url = str(row.get('url', '/')).strip()
+        host = str(row.get('host', 'localhost')).strip()
+        ua = str(row.get('user-agent', '')).strip()
+        cookie = str(row.get('cookie', '')).strip()
+        ctype = str(row.get('content-type', '')).strip()
+        body = str(row.get('content', '')).strip()
+        
+        # Reconstruct exactly like the training generator
+        req = f"{method} {url} HTTP/1.1\nHost: {host}\nUser-Agent: {ua}"
+        if cookie and cookie != 'nan': req += f"\nCookie: {cookie}"
+        if ctype and ctype != 'nan': req += f"\nContent-Type: {ctype}"
+        
+        # Add body if it exists
+        if body and body != 'nan':
+            req += f"\n\n{body}"
+            
+        return req
+
+    df['text'] = df.apply(build_request, axis=1)
+    
+    # Map Labels
+    label_map = {'normal': 0, 'anomalous': 1, 'anomaly': 1, 'attack': 1, 'n': 0, 'a': 1, '0': 0, '1': 1}
+    df['label'] = df[label_col].astype(str).str.lower().str.strip().map(label_map)
+    df = df.dropna(subset=['label'])
+    df['label'] = df['label'].astype(int)
+    return df[['text', 'label']].copy()
+
+df_clean = reconstruct_raw_http(df_raw)
+df_test = df_clean.sample(n=min(5000, len(df_clean)), random_state=42).reset_index(drop=True)
+print(f"✅ Test Set Ready: {len(df_test)} Reconstructed Raw HTTP Requests")
+
+# ==========================================
+# 2. LOAD MASTER MODEL & INFER (MAX_LENGTH = 384)
+# ==========================================
+# Update this path to where you uploaded your new 'waf_triage_master' folder in Kaggle
+model_path = "/kaggle/input/your-waf-models/waf_triage_master" 
+if not os.path.exists(model_path):
+    for root, dirs, files in os.walk("/kaggle/input/"):
+        if "config.json" in files and "master" in root:
+            model_path = root
+            break
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"🚀 Using device: {device}")
+
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoModelForSequenceClassification.from_pretrained(model_path).to(device)
+model.eval()
+
+all_logits = []
+all_labels = []
+batch_size = 32 # Slightly smaller batch size since 384 tokens uses more GPU VRAM
+
+print("🔄 Running Inference (Full Context, 384 Tokens)...")
+for i in tqdm(range(0, len(df_test), batch_size)):
+    batch_texts = df_test['text'].iloc[i:i+batch_size].tolist()
+    batch_labels = df_test['label'].iloc[i:i+batch_size].values
+    
+    # CRITICAL UPDATE: max_length=384 to match training!
+    inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, max_length=384, padding=True).to(device)
+    
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        
+    all_logits.extend(logits.cpu())
+    all_labels.extend(batch_labels)
+
+logits_tensor = torch.stack(all_logits)
+labels_tensor = torch.tensor(all_labels)
+
+# ==========================================
+# 3. CALCULATE CALIBRATION & PLOT
+# ==========================================
+probs = F.softmax(logits_tensor, dim=-1)
+preds = torch.argmax(probs, dim=-1).numpy()
+confs = torch.max(probs, dim=-1).values.numpy()
+correct = preds == labels_tensor.numpy()
+
+raw_accuracy = correct.mean() * 100
+print(f"\n🎯 RAW ACCURACY ON REAL-WORLD DATA: {raw_accuracy:.2f}%")
+
+# Plotting
+bins = np.linspace(0, 1, 11)
+bin_accs, bin_confs = [], []
+
+for b in range(len(bins)-1):
+    mask = (confs > bins[b]) & (confs <= bins[b+1])
+    if mask.sum() > 0:
+        bin_accs.append(correct[mask].mean())
+        bin_confs.append(confs[mask].mean())
+
+plt.figure(figsize=(10,6))
+plt.plot([0,1], [0,1], '--', color='gray', label='Perfect Calibration', linewidth=2)
+plt.plot(bin_confs, bin_accs, '-s', color='#2ca02c', label='waf_triage_master (Full Context)', linewidth=2, markersize=8)
+plt.xlabel("Model Confidence", fontsize=12)
+plt.ylabel("Actual Accuracy", fontsize=12)
+plt.title("Master WAF Calibration on Real-World CSIC 2010 (Full HTTP Headers)", fontsize=14)
+plt.legend(fontsize=11)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+from transformers import Trainer, TrainingArguments, DataCollatorWithPadding
+from torch.utils.data import Dataset
+import torch
+
+# ==========================================
+# 1. PREPARE THE "ADAPTATION" DATASET
+# ==========================================
+# We take just 1,000 Benign and 1,000 Malicious CSIC requests to teach the vocabulary
+df_adapt_benign = df_clean[df_clean['label'] == 0].sample(1000, random_state=42)
+df_adapt_mal = df_clean[df_clean['label'] == 1].sample(1000, random_state=42)
+df_adapt = pd.concat([df_adapt_benign, df_adapt_mal]).sample(frac=1).reset_index(drop=True)
+
+class CSICDataset(Dataset):
+    def __init__(self, df, tokenizer, max_length=384):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    def __len__(self): return len(self.df)
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        enc = self.tokenizer(str(row['text']), truncation=True, max_length=self.max_length)
+        return {'input_ids': enc['input_ids'], 'attention_mask': enc['attention_mask'], 'labels': torch.tensor(row['label'], dtype=torch.long)}
+
+adapt_dataset = CSICDataset(df_adapt, tokenizer)
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+# ==========================================
+# 2. ONE-EPOCH DOMAIN ADAPTATION
+# ==========================================
+print("🧠 Adapting model to CSIC 2010 Vocabulary (1 Epoch)...")
+training_args = TrainingArguments(
+    output_dir="./csic_adaptation",
+    per_device_train_batch_size=16,
+    num_train_epochs=1, # JUST ONE EPOCH!
+    learning_rate=2e-5,
+    fp16=False,
+    report_to="none",
+    disable_tqdm=False
+)
+
+# Note: Using 'processing_class' or 'tokenizer' depending on HF version
+try:
+    trainer = Trainer(model=model, args=training_args, train_dataset=adapt_dataset, processing_class=tokenizer, data_collator=data_collator)
+except TypeError:
+    trainer = Trainer(model=model, args=training_args, train_dataset=adapt_dataset, tokenizer=tokenizer, data_collator=data_collator)
+
+trainer.train()
+print("✅ Adaptation Complete!")
+
+# ==========================================
+# 3. RE-RUN INFERENCE ON THE FULL TEST SET
+# ==========================================
+print("🔄 Re-evaluating on the full CSIC test set...")
+all_logits_adapted = []
+batch_size = 32
+
+for i in tqdm(range(0, len(df_test), batch_size)):
+    batch_texts = df_test['text'].iloc[i:i+batch_size].tolist()
+    inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, max_length=384, padding=True).to(device)
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    all_logits_adapted.extend(logits.cpu())
+
+logits_tensor_adapted = torch.stack(all_logits_adapted)
+probs_adapted = F.softmax(logits_tensor_adapted, dim=-1)
+preds_adapted = torch.argmax(probs_adapted, dim=-1).numpy()
+confs_adapted = torch.max(probs_adapted, dim=-1).values.numpy()
+correct_adapted = preds_adapted == labels_tensor.numpy()
+
+adapted_accuracy = correct_adapted.mean() * 100
+print(f"\n🎯 ADAPTED ACCURACY: {adapted_accuracy:.2f}%")
+
+# Plot the new calibrated curve
+bins = np.linspace(0, 1, 11)
+bin_accs_ad, bin_confs_ad = [], []
+for b in range(len(bins)-1):
+    mask = (confs_adapted > bins[b]) & (confs_adapted <= bins[b+1])
+    if mask.sum() > 0:
+        bin_accs_ad.append(correct_adapted[mask].mean())
+        bin_confs_ad.append(confs_adapted[mask].mean())
+
+plt.figure(figsize=(10,6))
+plt.plot([0,1], [0,1], '--', color='gray', label='Perfect Calibration', linewidth=2)
+plt.plot(bin_confs, bin_accs, '-o', color='lightcoral', label='Before Adaptation (Synthetic Only)', alpha=0.6)
+plt.plot(bin_confs_ad, bin_accs_ad, '-s', color='green', label='After 1-Epoch Adaptation', linewidth=2, markersize=8)
+plt.xlabel("Model Confidence", fontsize=12)
+plt.ylabel("Actual Accuracy", fontsize=12)
+plt.title("Domain-Adaptive Fine-Tuning (Few-Shot Learning)", fontsize=14)
+plt.legend(fontsize=11)
+plt.grid(True, alpha=0.3)
+plt.show()
