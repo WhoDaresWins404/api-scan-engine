@@ -121,7 +121,7 @@ async def test_severity_filter_passes_above_threshold():
                                 json_path=None, csv_path=None)
     await reporter.start()
     for sev in ("low", "medium", "high", "critical"):
-        await store.publish("findings", _finding(severity=sev))
+        await store.publish("findings", _finding(severity=sev, title=f"Finding {sev}"))
     assert reporter._reported_count == 4
 
 
@@ -131,7 +131,7 @@ async def test_severity_filter_info_passes_all():
                                 json_path=None, csv_path=None)
     await reporter.start()
     for sev in SEVERITY_ORDER:
-        await store.publish("findings", _finding(severity=sev))
+        await store.publish("findings", _finding(severity=sev, title=f"Finding {sev}"))
     assert reporter._reported_count == len(SEVERITY_ORDER)
 
 
