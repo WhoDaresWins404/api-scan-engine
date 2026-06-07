@@ -5,6 +5,7 @@
 # pass the new instance at startup. Zero module changes required.
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -70,7 +71,10 @@ class SQLiteStore(IStore):
     # ------------------------------------------------------------------
 
     async def write(self, collection: str, record: dict) -> str:
-        record_id = record.get("id") or str(uuid.uuid4())
+        # Use a content-based deterministic ID where possible so that
+        # INSERT OR REPLACE naturally collapses duplicate records across
+        # proxy restarts instead of accumulating them with fresh UUIDs.
+        record_id = record.get("id") or _content_id(collection, record)
         record["id"] = record_id
         record.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
@@ -122,7 +126,55 @@ class SQLiteStore(IStore):
     # Maintenance
     # ------------------------------------------------------------------
 
-    def vacuum(self, max_age_days: int = 30) -> int:
+    def deduplicate(self) -> dict[str, int]:
+        """
+        Remove duplicate records from the existing database.
+
+        Duplicates are records in the same collection with the same
+        content-based key (title+module+host for findings,
+        method+host+path for endpoints).  Keeps the earliest record
+        (lowest created_at) and deletes the rest.
+
+        Returns a dict mapping collection name to number of rows deleted.
+        Safe to call on a live database — uses a single transaction.
+        """
+        rows = self._conn.execute(
+            "SELECT id, collection, data FROM records"
+        ).fetchall()
+
+        # Group by (collection, content_key) — keep earliest
+        seen: dict[tuple[str, str], tuple[str, str]] = {}  # key -> (id, created_at)
+        to_delete: list[str] = []
+
+        for row in rows:
+            rec = json.loads(row["data"])
+            col = row["collection"]
+            key = _content_key(col, rec)
+            full_key = (col, key)
+
+            if full_key not in seen:
+                seen[full_key] = row["id"]
+            else:
+                to_delete.append(row["id"])
+
+        deleted_by_col: dict[str, int] = {}
+        if to_delete:
+            for rid in to_delete:
+                # find collection for reporting
+                row = self._conn.execute(
+                    "SELECT collection FROM records WHERE id=?", (rid,)
+                ).fetchone()
+                if row:
+                    col = row["collection"]
+                    deleted_by_col[col] = deleted_by_col.get(col, 0) + 1
+                self._conn.execute("DELETE FROM records WHERE id=?", (rid,))
+            self._conn.commit()
+            # Reclaim space
+            self._conn.isolation_level = None
+            self._conn.execute("VACUUM")
+            self._conn.isolation_level = ""
+
+        return deleted_by_col
         """
         Delete records older than max_age_days from all collections
         EXCEPT 'endpoints' (we want to keep the full discovered map).
@@ -145,3 +197,38 @@ class SQLiteStore(IStore):
         self._conn.execute("VACUUM")
         self._conn.isolation_level = ""   # restore default (deferred)
         return deleted
+
+
+# ── content-based ID helpers ──────────────────────────────────────
+
+def _content_key(collection: str, record: dict) -> str:
+    """Return a stable string key representing the record's logical identity."""
+    if collection == "findings":
+        # Same finding = same module + title + host (from evidence URL)
+        from urllib.parse import urlparse
+        url   = record.get("evidence", {}).get("url", "") if isinstance(record.get("evidence"), dict) else ""
+        host  = urlparse(url).netloc if url else record.get("host", "")
+        parts = [
+            record.get("module_name", ""),
+            record.get("title", ""),
+            host,
+        ]
+    elif collection == "endpoints":
+        parts = [
+            record.get("method", ""),
+            record.get("host", ""),
+            record.get("path", ""),
+        ]
+    elif collection == "health":
+        parts = [record.get("module_name", "")]
+    else:
+        # Fallback: use all values sorted for stability
+        parts = [str(v) for v in sorted(record.values())]
+
+    return "|".join(parts)
+
+
+def _content_id(collection: str, record: dict) -> str:
+    """Return a short deterministic hex ID for a record."""
+    key = _content_key(collection, record)
+    return hashlib.sha1(f"{collection}:{key}".encode()).hexdigest()[:16]
