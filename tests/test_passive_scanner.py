@@ -129,16 +129,24 @@ def test_secret_in_url_value_preview_truncated():
 # ─────────────────────────────────────────────────────────────────
 
 def test_unauthed_sensitive_path_flagged():
-    req = _req(url="https://api.example.com/api/users", method="GET", headers={})
+    # POST without auth on sensitive path should be flagged
+    req = _req(url="https://api.example.com/api/users", method="POST", headers={})
     findings = _check_unauthed_sensitive_path(req)
     assert len(findings) == 1
     assert findings[0].severity == "medium"
 
 
+def test_unauthed_sensitive_path_get_not_flagged():
+    # GET without auth is no longer flagged — public APIs commonly allow this
+    req = _req(url="https://api.example.com/api/users", method="GET", headers={})
+    findings = _check_unauthed_sensitive_path(req)
+    assert findings == []
+
+
 def test_unauthed_sensitive_path_with_auth_header_ignored():
     req = _req(
         url="https://api.example.com/api/users",
-        method="GET",
+        method="POST",
         headers={"Authorization": "Bearer token123"},
     )
     findings = _check_unauthed_sensitive_path(req)
@@ -148,7 +156,7 @@ def test_unauthed_sensitive_path_with_auth_header_ignored():
 def test_unauthed_sensitive_path_with_cookie_ignored():
     req = _req(
         url="https://api.example.com/api/users",
-        method="GET",
+        method="POST",
         headers={"Cookie": "session=abc123"},
     )
     findings = _check_unauthed_sensitive_path(req)
@@ -172,7 +180,7 @@ def test_non_sensitive_path_not_flagged():
 
 
 def test_unauthed_admin_path_flagged():
-    req = _req(url="https://example.com/admin/dashboard", method="GET", headers={})
+    req = _req(url="https://example.com/admin/dashboard", method="POST", headers={})
     findings = _check_unauthed_sensitive_path(req)
     assert len(findings) == 1
 

@@ -70,7 +70,7 @@ CSV_FIELDS = [
 
 class FindingReporter:
     name = "finding_reporter"
-    version = "0.1.0"
+    version = "0.2.0"
 
     def __init__(
         self,
@@ -96,6 +96,9 @@ class FindingReporter:
         self._csv_file = None
         self._csv_writer = None
         self._reported_count = 0
+        # Output dedup: suppress identical (title, host) pairs within a session
+        # so proxy restarts don't re-flood the console/CSV with known findings.
+        self._output_seen: set[tuple[str, str]] = set()
 
     # ── lifecycle ─────────────────────────────────────────────────
 
@@ -137,7 +140,6 @@ class FindingReporter:
 
     async def _on_finding(self, payload: Any) -> None:
         """Called by IStore.publish() for every new finding."""
-        # payload may be a Finding dataclass or a plain dict (from store)
         if isinstance(payload, Finding):
             f = payload
         elif isinstance(payload, dict):
@@ -147,6 +149,13 @@ class FindingReporter:
 
         if SEVERITY_ORDER.get(f.severity, 0) < self._min_rank:
             return
+
+        # Output dedup — suppress same (title, host) within this session
+        host = _host_from_evidence(f) if hasattr(f, "evidence") else ""
+        output_key = (f.title, host)
+        if output_key in self._output_seen:
+            return
+        self._output_seen.add(output_key)
 
         self._reported_count += 1
 
@@ -235,6 +244,13 @@ class FindingReporter:
 
 
 # ── helpers ───────────────────────────────────────────────────────
+
+def _host_from_evidence(finding: Finding) -> str:
+    """Extract hostname from finding evidence URL."""
+    from urllib.parse import urlparse
+    url = finding.evidence.get("url", "") if finding.evidence else ""
+    return urlparse(url).netloc if url else ""
+
 
 def _dict_to_finding(d: dict) -> Finding:
     ts_raw = d.get("timestamp")

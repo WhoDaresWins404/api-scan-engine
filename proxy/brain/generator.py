@@ -134,6 +134,7 @@ async def generate(db_path: str) -> None:
     """Read store + journal, write PROJECT_BRAIN.md."""
     from proxy.core.store import SQLiteStore
     from proxy.brain.journal import Journal
+    from proxy.modules.passive_scanner import _BLOCKED_HOST_SUFFIXES
 
     store = SQLiteStore(db_path)
     store.open()
@@ -146,16 +147,29 @@ async def generate(db_path: str) -> None:
     journal = Journal(db_path)
     entries = journal.tail(20)
 
+    def _is_blocked_host(host: str) -> bool:
+        h = host.lower()
+        for suffix in _BLOCKED_HOST_SUFFIXES:
+            if h == suffix.lstrip(".") or h.endswith(suffix):
+                return True
+        return False
+
+    # Filter endpoints — exclude blocked CDN/analytics hosts
+    api_endpoints = [ep for ep in endpoints if not _is_blocked_host(ep.get("host", ""))]
+    noise_count = len(endpoints) - len(api_endpoints)
+
     # ── endpoints section ─────────────────────────────────────────
-    if endpoints:
+    if api_endpoints:
         lines = []
-        for ep in sorted(endpoints, key=lambda e: (e.get("host", ""), e.get("path", ""))):
+        for ep in sorted(api_endpoints, key=lambda e: (e.get("host", ""), e.get("path", ""))):
             status = ep.get("last_status") or "—"
             lines.append(
                 f"- {ep.get('method', '?')} "
                 f"{ep.get('scheme', 'https')}://{ep.get('host', '?')}{ep.get('path', '/')} "
                 f"  [last status: {status}]"
             )
+        if noise_count:
+            lines.append(f"\n_{noise_count} CDN/analytics endpoint(s) hidden — see full scan.db for details._")
         endpoints_section = "\n".join(lines)
     else:
         endpoints_section = "_None yet._"
@@ -190,9 +204,9 @@ async def generate(db_path: str) -> None:
 
     # PROJECT_BRAIN.md — lean session handoff doc (counts only, no raw lists)
     brain_content = BRAIN_TEMPLATE.format(
-        generated_at   = now_str,
-        endpoint_count = len(endpoints),
-        finding_count  = len(findings),
+        generated_at    = now_str,
+        endpoint_count  = f"{len(api_endpoints)} ({noise_count} CDN/analytics hidden)",
+        finding_count   = len(findings),
         journal_section = journal_section,
     )
     BRAIN_PATH.write_text(brain_content)
@@ -200,7 +214,7 @@ async def generate(db_path: str) -> None:
     # SCAN_STATUS.md — full traffic data (never paste into chat)
     status_content = STATUS_TEMPLATE.format(
         generated_at      = now_str,
-        endpoint_count    = len(endpoints),
+        endpoint_count    = len(api_endpoints),
         finding_count     = len(findings),
         endpoints_section = endpoints_section,
         findings_section  = findings_section,
@@ -208,8 +222,8 @@ async def generate(db_path: str) -> None:
     STATUS_PATH.write_text(status_content)
 
     log.info(
-        "PROJECT_BRAIN.md + SCAN_STATUS.md updated  (%d endpoints, %d findings)",
-        len(endpoints), len(findings),
+        "PROJECT_BRAIN.md + SCAN_STATUS.md updated  (%d api endpoints, %d hidden, %d findings)",
+        len(api_endpoints), noise_count, len(findings),
     )
 
 

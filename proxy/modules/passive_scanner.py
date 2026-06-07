@@ -300,7 +300,9 @@ def _check_secret_in_url(req: ProxyRequest) -> list[Finding]:
 
 
 def _check_unauthed_sensitive_path(req: ProxyRequest) -> list[Finding]:
-    if req.method not in _AUTH_CHECK_METHODS:
+    # Only flag write methods — GET on public APIs without auth is common
+    # and rarely actionable. POST/PUT/PATCH/DELETE without auth is significant.
+    if req.method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return []
 
     parsed = urlparse(req.url)

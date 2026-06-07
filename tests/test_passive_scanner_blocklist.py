@@ -111,7 +111,7 @@ async def test_on_request_blocked_host_no_findings():
 
 async def test_on_request_unblocked_host_finds_secret():
     scanner = PassiveScanner(FakeStore())
-    req = _req("https://api.example.com/login?api_key=supersecret123")
+    req = _req("https://api.example.com/login?api_key=supersecret123", method="POST")
     findings = await scanner.on_request(req)
     assert len(findings) == 1
     assert findings[0].severity == "high"
@@ -176,4 +176,4 @@ def test_known_hosts_blocklist_coverage(host):
     if host in ("static.files.bbci.co.uk", "www.motorola.com"):
         assert blocked is False, f"{host} should not be blocked"
     else:
-        assert blocked is True, f"{host} should be blocked" 
+        assert blocked is True, f"{host} should be blocked"
