@@ -1,5 +1,5 @@
 # PROJECT_BRAIN — API Scan Engine
-_Last updated: 2026-06-01 11:18 UTC_
+_Last updated: 2026-06-07 13:18 UTC_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
@@ -63,8 +63,8 @@ tests/
 | FindingReporter | 0.1.0   | Real-time output -- console / JSON / CSV   |
 
 ## Traffic summary (see SCAN_STATUS.md for full details)
-- Endpoints discovered: 625
-- Findings logged:      822
+- Endpoints discovered: 1956
+- Findings logged:      2641
 
 ## Proxy start commands
   python -m proxy.core.runner --host 0.0.0.0 --port 8080 --db scan.db
@@ -97,6 +97,9 @@ tests/
 - 2026-06-01 11:16  [proxy]  stopped — regenerating PROJECT_BRAIN.md
 - 2026-06-01 11:18  [proxy]  started on 0.0.0.0:8080
 - 2026-06-01 11:18  [proxy]  stopped — regenerating PROJECT_BRAIN.md
+- 2026-06-01 11:26  [proxy]  started on 0.0.0.0:8080
+- 2026-06-07 13:06  [proxy]  started on 0.0.0.0:8080
+- 2026-06-07 13:18  [proxy]  stopped — regenerating PROJECT_BRAIN.md
 
 ## Next session goal
 - PassiveScanner host blocklist -- skip CDN/analytics/ad hosts to cut false positives
