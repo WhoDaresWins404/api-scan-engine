@@ -44,6 +44,9 @@ async def run_proxy(
     from proxy.modules.endpoint_mapper import EndpointMapper
     from proxy.modules.passive_scanner import PassiveScanner
     from proxy.modules.finding_reporter import FindingReporter
+    from proxy.modules.graphql_detector import GraphQLDetector
+    from proxy.modules.graphql_detector import GraphQLDetector
+    from proxy.modules.graphql_detector import GraphQLDetector
     from proxy.brain.generator import generate, brain_loop
     from proxy.brain.journal import Journal
 
@@ -67,7 +70,9 @@ async def run_proxy(
     modules = [
         EndpointMapper(store),
         PassiveScanner(store),
-        reporter,            # wired as IModule — healthcheck included in sweep
+        GraphQLDetector(store),
+        reporter,            # wired as IModule
+        GraphQLDetector(store),
         *extra_modules,
     ]
 
