@@ -1,11 +1,12 @@
 """
 proxy/brain/generator.py
 ────────────────────────────────────────────────────────────────────
-Reads the live SQLiteStore and rewrites PROJECT_BRAIN.md.
+Reads the live SQLiteStore and writes:
+  PROJECT_BRAIN.md  -- lean session handoff (~6KB, never contains raw traffic)
+  SCAN_STATUS.md    -- full traffic data (never paste into chat)
 
 Triggered three ways:
-  1. Automatically every BRAIN_INTERVAL seconds while proxy runs
-     (background asyncio task started by runner.py)
+  1. Every BRAIN_INTERVAL seconds while proxy runs (background task)
   2. On clean proxy shutdown (runner.py finally block)
   3. Manually: python -m proxy.brain.generator --db scan.db
 """
@@ -20,7 +21,7 @@ from pathlib import Path
 log = logging.getLogger("scan.brain")
 
 BRAIN_INTERVAL = 600        # regenerate every 10 minutes
-BRAIN_PATH = Path(__file__).parent.parent.parent / "PROJECT_BRAIN.md"
+BRAIN_PATH  = Path(__file__).parent.parent.parent / "PROJECT_BRAIN.md"
 STATUS_PATH = Path(__file__).parent.parent.parent / "SCAN_STATUS.md"
 
 BRAIN_TEMPLATE = """# PROJECT_BRAIN — API Scan Engine
@@ -28,10 +29,10 @@ _Last updated: {generated_at}_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
-- Proxy core: mitmproxy (Phase 1) → asyncio+httpx (Phase 3)
+- Proxy core: mitmproxy (Phase 1) -> asyncio+httpx (Phase 3)
 - Module model: in-process, IModule interface enforced
-- Store: SQLite (Phase 1) → PostgreSQL (Phase 2), IStore abstraction
-- Protocols: HTTP/HTTPS (Phase 1) → GraphQL/WS (Phase 2) → gRPC (Phase 3)
+- Store: SQLite (Phase 1) -> PostgreSQL (Phase 2), IStore abstraction
+- Protocols: HTTP/HTTPS (Phase 1) -> GraphQL/WS (Phase 2) -> gRPC (Phase 3)
 - Workflow: PC1 (Windows/VS Code) -> GitHub -> PC2 (Ubuntu VM git pull)
 - Lab environment: VirtualBox Ubuntu VM (192.168.50.221), DHCP reserved
 
@@ -47,45 +48,58 @@ _Paste this file at the start of every new session._
 proxy/
   core/
     interfaces.py       # IModule, IStore, shared dataclasses
-    store.py            # SQLiteStore + vacuum(max_age_days)
+    store.py            # SQLiteStore + vacuum() + deduplicate() + stats() + CLI
     proxy.py            # ScanAddon (mitmproxy addon)
     runner.py           # CLI launcher -- all modules + vacuum + brain_loop
   modules/
     endpoint_mapper.py  # host+path+method discovery, asset filtering (v0.3.0)
-    passive_scanner.py  # passive security checks, 24h dedup (v0.2.0)
-    finding_reporter.py # real-time console/JSON/CSV output (v0.1.0)
+    passive_scanner.py  # passive security checks, host blocklist (v0.3.0)
+    graphql_detector.py # GraphQL introspection/mutation/batch/error (v0.1.0)
+    secret_scanner.py   # response body secret detection (v0.1.0)
+    finding_reporter.py # real-time console/JSON/CSV output, dedup (v0.2.0)
   brain/
-    generator.py        # PROJECT_BRAIN.md (lean) + SCAN_STATUS.md (traffic data)
+    generator.py        # PROJECT_BRAIN.md (lean) + SCAN_STATUS.md (filtered)
     journal.py          # append-only JSONL event log
 conftest.py             # pytest sys.path fix
 pyproject.toml          # packaging + pytest config (asyncio_mode=auto)
 .gitignore              # PROJECT_BRAIN.md, SCAN_STATUS.md, scan.db, findings.* excluded
 tests/
-  test_proxy.py              # 16 tests
-  test_passive_scanner.py    # 35 tests
-  test_finding_reporter.py   # 16 tests
-  test_session006.py         # 20 tests
+  test_proxy.py                       # 16 tests
+  test_passive_scanner.py             # 36 tests
+  test_passive_scanner_blocklist.py   # 18 tests
+  test_finding_reporter.py            # 16 tests
+  test_session006.py                  # 20 tests
+  test_graphql_detector.py            # 26 tests
+  test_secret_scanner.py              # TBD
 
 ## Current state
 - [x] Project skeleton, SQLiteStore, EndpointMapper, Journal, BrainGenerator
 - [x] mitmproxy integration -- ScanAddon + runner.py
-- [x] PassiveScanner v0.2.0 -- 5 detection categories, 24h dedup
-- [x] FindingReporter v0.1.0 -- console (ANSI colour), JSON, CSV, severity filter
-- [x] FindingReporter wired as IModule in runner.py modules list
-- [x] SQLiteStore.vacuum(max_age_days=30) -- weekly background task
-- [x] EndpointMapper v0.3.0 -- static asset filtering (JS/CSS/images/fonts/media)
+- [x] PassiveScanner v0.3.0 -- host blocklist, write-methods-only auth check
+- [x] GraphQLDetector v0.1.0 -- introspection/mutation/batch/error detection
+- [x] SecretScanner v0.1.0 -- response body secret detection
+- [x] FindingReporter v0.2.0 -- output dedup, console/JSON/CSV
+- [x] SQLiteStore -- vacuum, deduplicate, stats, deterministic IDs, CLI
+- [x] EndpointMapper v0.3.0 -- static asset filtering
 - [x] Clean proxy shutdown -- CancelledError handled, no traceback
-- [x] 87 tests passing, 0 warnings
+- [x] 146+ tests passing, 0 warnings
 - [x] GitHub workflow -- credentials stored, no password prompts
-- [x] PROJECT_BRAIN.md in .gitignore -- no merge conflicts on git pull
 - [x] CA cert deployed -- TLS interception working subnet-wide
+- [x] scan.db deduped -- 22070 -> 2559 records (88% reduction)
 
 ## Module summary
-| Module          | Version | Role                                       |
-|-----------------|---------|--------------------------------------------|
-| EndpointMapper  | 0.3.0   | Discover API endpoints, skip static assets |
-| PassiveScanner  | 0.2.0   | Detect security issues, 24h dedup          |
-| FindingReporter | 0.1.0   | Real-time output -- console / JSON / CSV   |
+| Module          | Version | Role                                              |
+|-----------------|---------|---------------------------------------------------|
+| EndpointMapper  | 0.3.0   | Discover API endpoints, skip static assets        |
+| PassiveScanner  | 0.3.0   | Security checks, host blocklist, write-method auth|
+| GraphQLDetector | 0.1.0   | GraphQL introspection/mutation/batch/error checks |
+| SecretScanner   | 0.1.0   | Detect secrets in response bodies                 |
+| FindingReporter | 0.2.0   | Real-time output, session dedup, console/JSON/CSV |
+
+## DB maintenance commands
+  python -m proxy.core.store --db scan.db stats
+  python -m proxy.core.store --db scan.db dedup
+  python -m proxy.core.store --db scan.db vacuum --days 30
 
 ## Traffic summary (see SCAN_STATUS.md for full details)
 - Endpoints discovered: {endpoint_count}
@@ -104,18 +118,19 @@ tests/
 - GitHub credentials: git config --global credential.helper store
 - SQLite VACUUM must run outside a transaction -- commit first, then
   set isolation_level=None, VACUUM, restore isolation_level=""
+- generator.py BRAIN_TEMPLATE needs manual update after major state changes
 
 ## Last journal entries
 {journal_section}
 
 ## Next session goal
-- PassiveScanner host blocklist -- skip CDN/analytics/ad hosts to cut false positives
-- Review findings.csv quality after live browsing session
-- Consider GraphQL/WebSocket detection (Phase 2 prep)
+- WebSocket detection (Phase 2 continuation)
+- PostgreSQL store migration (Phase 2 -- swap SQLiteStore via IStore abstraction)
+- Review findings quality after SecretScanner goes live
 """
 
 STATUS_TEMPLATE = """# SCAN_STATUS — API Scan Engine
-_Auto-generated: {generated_at} — do NOT paste into chat sessions_
+_Auto-generated: {generated_at} -- do NOT paste into chat sessions_
 _For session handoff use PROJECT_BRAIN.md instead_
 
 ## Summary
@@ -131,7 +146,7 @@ _For session handoff use PROJECT_BRAIN.md instead_
 
 
 async def generate(db_path: str) -> None:
-    """Read store + journal, write PROJECT_BRAIN.md."""
+    """Read store + journal, write PROJECT_BRAIN.md and SCAN_STATUS.md."""
     from proxy.core.store import SQLiteStore
     from proxy.brain.journal import Journal
     from proxy.modules.passive_scanner import _BLOCKED_HOST_SUFFIXES
@@ -154,9 +169,9 @@ async def generate(db_path: str) -> None:
                 return True
         return False
 
-    # Filter endpoints — exclude blocked CDN/analytics hosts
+    # Filter endpoints -- exclude blocked CDN/analytics hosts
     api_endpoints = [ep for ep in endpoints if not _is_blocked_host(ep.get("host", ""))]
-    noise_count = len(endpoints) - len(api_endpoints)
+    noise_count   = len(endpoints) - len(api_endpoints)
 
     # ── endpoints section ─────────────────────────────────────────
     if api_endpoints:
@@ -169,7 +184,7 @@ async def generate(db_path: str) -> None:
                 f"  [last status: {status}]"
             )
         if noise_count:
-            lines.append(f"\n_{noise_count} CDN/analytics endpoint(s) hidden — see full scan.db for details._")
+            lines.append(f"\n_{noise_count} CDN/analytics endpoint(s) hidden._")
         endpoints_section = "\n".join(lines)
     else:
         endpoints_section = "_None yet._"
@@ -184,8 +199,8 @@ async def generate(db_path: str) -> None:
             for f in by_sev.get(sev, []):
                 lines.append(
                     f"- [{sev.upper()}] {f.get('title', '')} "
-                    f"— {f.get('module_name', '')} "
-                    f"(request {f.get('request_id', '?')[:8]}…)"
+                    f"-- {f.get('module_name', '')} "
+                    f"(request {f.get('request_id', '?')[:8]}...)"
                 )
         findings_section = "\n".join(lines)
     else:
@@ -202,7 +217,6 @@ async def generate(db_path: str) -> None:
 
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # PROJECT_BRAIN.md — lean session handoff doc (counts only, no raw lists)
     brain_content = BRAIN_TEMPLATE.format(
         generated_at    = now_str,
         endpoint_count  = f"{len(api_endpoints)} ({noise_count} CDN/analytics hidden)",
@@ -211,7 +225,6 @@ async def generate(db_path: str) -> None:
     )
     BRAIN_PATH.write_text(brain_content)
 
-    # SCAN_STATUS.md — full traffic data (never paste into chat)
     status_content = STATUS_TEMPLATE.format(
         generated_at      = now_str,
         endpoint_count    = len(api_endpoints),
@@ -228,7 +241,7 @@ async def generate(db_path: str) -> None:
 
 
 async def brain_loop(db_path: str) -> None:
-    """Background task: regenerate PROJECT_BRAIN.md every BRAIN_INTERVAL seconds."""
+    """Background task: regenerate every BRAIN_INTERVAL seconds."""
     while True:
         await asyncio.sleep(BRAIN_INTERVAL)
         try:
