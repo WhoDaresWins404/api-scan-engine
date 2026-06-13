@@ -284,4 +284,3 @@ def _decode_body(body: bytes | None) -> str:
         return body.decode("utf-8", errors="replace")
     except Exception:
         return ""
-

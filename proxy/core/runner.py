@@ -43,10 +43,9 @@ async def run_proxy(
     from proxy.core.store import SQLiteStore
     from proxy.modules.endpoint_mapper import EndpointMapper
     from proxy.modules.passive_scanner import PassiveScanner
+    from proxy.modules.graphql_detector import GraphQLDetector
+    from proxy.modules.secret_scanner import SecretScanner
     from proxy.modules.finding_reporter import FindingReporter
-    from proxy.modules.graphql_detector import GraphQLDetector
-    from proxy.modules.graphql_detector import GraphQLDetector
-    from proxy.modules.graphql_detector import GraphQLDetector
     from proxy.brain.generator import generate, brain_loop
     from proxy.brain.journal import Journal
 
@@ -56,8 +55,6 @@ async def run_proxy(
     journal = Journal(db_path)
     journal.log("proxy", f"started on {host}:{port}")
 
-    # FindingReporter wired as IModule so ScanAddon calls on_request/on_response
-    # AND as a subscriber via reporter.start() for real-time pub/sub output
     reporter = FindingReporter(
         store,
         min_severity=min_severity,
@@ -71,8 +68,8 @@ async def run_proxy(
         EndpointMapper(store),
         PassiveScanner(store),
         GraphQLDetector(store),
-        reporter,            # wired as IModule
-        GraphQLDetector(store),
+        SecretScanner(store),
+        reporter,
         *extra_modules,
     ]
 
@@ -98,7 +95,7 @@ async def run_proxy(
     try:
         await master.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        log.info("Shutting down…")
+        log.info("Shutting down\u2026")
     finally:
         brain_task.cancel()
         vacuum_task.cancel()
@@ -110,7 +107,7 @@ async def run_proxy(
         master.shutdown()
         await reporter.stop()
         store.close()
-        journal.log("proxy", "stopped — regenerating PROJECT_BRAIN.md")
+        journal.log("proxy", "stopped \u2014 regenerating PROJECT_BRAIN.md")
         await generate(db_path)
         log.info("PROJECT_BRAIN.md updated")
 
@@ -121,14 +118,14 @@ async def _vacuum_loop(store) -> None:
         await asyncio.sleep(VACUUM_INTERVAL)
         try:
             deleted = store.vacuum(max_age_days=30)
-            log.info("Vacuum complete — %d record(s) deleted", deleted)
+            log.info("Vacuum complete \u2014 %d record(s) deleted", deleted)
         except Exception as exc:
             log.error("Vacuum failed: %s", exc)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="API Scan Engine — mitmproxy runner",
+        description="API Scan Engine \u2014 mitmproxy runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--host", default="127.0.0.1", help="Listen host")
