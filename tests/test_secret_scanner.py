@@ -88,7 +88,7 @@ def test_detects_aws_access_key():
     assert all(f.severity == "high" for f in findings)
 
 def test_detects_github_token():
-    text = '{"token": "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456"}'
+    text = '{"token": "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890"}'
     findings = _check_known_patterns(text, "req1", "https://api.example.com/")
     assert any("GitHub" in f.title for f in findings)
 
@@ -125,7 +125,7 @@ def test_preview_truncated():
     assert aws[0].evidence["preview"].endswith("...")
 
 def test_google_api_key_detected():
-    text = '{"key": "AIzaSyD-9tSrke72I6e0DVWherFinalEx4mple"}'
+    text = '{"key": "AIzaSyD9tSrke72I6e0DVWherFinalEx4mpleXX"}'
     findings = _check_known_patterns(text, "req1", "https://api.example.com/")
     assert any("Google" in f.title for f in findings)
 
