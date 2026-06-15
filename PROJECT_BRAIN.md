@@ -1,12 +1,12 @@
 # PROJECT_BRAIN — API Scan Engine
-_Session 011 start — 2026-06-10 UTC_
+_Session 012 start — 2026-06-15 UTC_
 _Paste this file at the start of every new session._
 
 ## Architecture (immutable decisions)
-- Proxy core: mitmproxy (Phase 1) → asyncio+httpx (Phase 3)
+- Proxy core: mitmproxy (Phase 1) -> asyncio+httpx (Phase 3)
 - Module model: in-process, IModule interface enforced
-- Store: SQLite (Phase 1) → PostgreSQL (Phase 2), IStore abstraction
-- Protocols: HTTP/HTTPS (Phase 1) → GraphQL/WS (Phase 2) → gRPC (Phase 3)
+- Store: SQLite (Phase 1) -> PostgreSQL (Phase 2), IStore abstraction
+- Protocols: HTTP/HTTPS (Phase 1) -> GraphQL/WS (Phase 2) -> gRPC (Phase 3)
 - Workflow: PC1 (Windows/VS Code) -> GitHub -> PC2 (Ubuntu VM git pull)
 - Lab environment: VirtualBox Ubuntu VM (192.168.50.221), DHCP reserved
 
@@ -24,11 +24,12 @@ proxy/
     interfaces.py       # IModule, IStore, shared dataclasses
     store.py            # SQLiteStore + vacuum() + deduplicate() + stats() + CLI
     proxy.py            # ScanAddon (mitmproxy addon)
-    runner.py           # CLI launcher -- all 4 modules + vacuum + brain_loop
+    runner.py           # CLI launcher -- all 5 modules + vacuum + brain_loop
   modules/
     endpoint_mapper.py  # host+path+method discovery, asset filtering (v0.3.0)
     passive_scanner.py  # passive security checks, host blocklist (v0.3.0)
-    graphql_detector.py # GraphQL detection -- introspection/mutation/batch (v0.1.0)
+    graphql_detector.py # GraphQL introspection/mutation/batch/error (v0.1.0)
+    secret_scanner.py   # response body secret detection (v0.1.0)
     finding_reporter.py # real-time console/JSON/CSV output, dedup (v0.2.0)
   brain/
     generator.py        # PROJECT_BRAIN.md (lean) + SCAN_STATUS.md (filtered)
@@ -43,44 +44,41 @@ tests/
   test_finding_reporter.py            # 16 tests
   test_session006.py                  # 20 tests
   test_graphql_detector.py            # 26 tests
-  # total: 146 tests (120 + 26)
+  test_secret_scanner.py              # 28 tests (2 fixed: GitHub/Google regex lengths)
+  # total: 174 tests
 
 ## Current state
 - [x] Project skeleton, SQLiteStore, EndpointMapper, Journal, BrainGenerator
 - [x] mitmproxy integration -- ScanAddon + runner.py
 - [x] PassiveScanner v0.3.0 -- host blocklist, write-methods-only auth check
-- [x] GraphQLDetector v0.1.0 -- introspection (high), mutation w/o auth (medium),
-      batched queries (medium), errors in response (low), endpoint discovery (info)
-- [x] FindingReporter v0.2.0 -- output dedup by (title, host) per session
-- [x] FindingReporter wired as IModule in runner.py modules list
-- [x] SQLiteStore.vacuum(max_age_days=30) -- weekly background task
-- [x] SQLiteStore.deduplicate() -- content-keyed, run manually or on startup
-- [x] SQLiteStore._content_id() -- deterministic IDs prevent future duplicates
-- [x] SQLiteStore CLI -- python -m proxy.core.store --db scan.db stats|dedup|vacuum
+- [x] GraphQLDetector v0.1.0 -- introspection/mutation/batch/error detection
+- [x] SecretScanner v0.1.0 -- AWS/GitHub/Stripe/Slack/JWT/high-entropy detection
+- [x] FindingReporter v0.2.0 -- output dedup, console/JSON/CSV
+- [x] SQLiteStore -- vacuum, deduplicate, stats, deterministic IDs, CLI
 - [x] EndpointMapper v0.3.0 -- static asset filtering
-- [x] generator.py -- SCAN_STATUS.md filters blocked hosts, shows noise count
+- [x] generator.py BRAIN_TEMPLATE -- updated to reflect all sessions to date
 - [x] Clean proxy shutdown -- CancelledError handled, no traceback
-- [x] 146 tests passing, 0 warnings
+- [x] 174 tests passing, 0 warnings
 - [x] GitHub workflow -- credentials stored, no password prompts
 - [x] CA cert deployed -- TLS interception working subnet-wide
 - [x] scan.db deduped -- 22070 -> 2559 records (88% reduction)
-- [ ] generator.py BRAIN_TEMPLATE stale -- needs update to reflect sessions 007-010
 
 ## Module summary
-| Module            | Version | Role                                              |
-|-------------------|---------|---------------------------------------------------|
-| EndpointMapper    | 0.3.0   | Discover API endpoints, skip static assets        |
-| PassiveScanner    | 0.3.0   | Security checks, host blocklist, write-method auth|
-| GraphQLDetector   | 0.1.0   | GraphQL introspection/mutation/batch/error checks |
-| FindingReporter   | 0.2.0   | Real-time output, session dedup, console/JSON/CSV |
+| Module          | Version | Role                                              |
+|-----------------|---------|---------------------------------------------------|
+| EndpointMapper  | 0.3.0   | Discover API endpoints, skip static assets        |
+| PassiveScanner  | 0.3.0   | Security checks, host blocklist, write-method auth|
+| GraphQLDetector | 0.1.0   | GraphQL introspection/mutation/batch/error checks |
+| SecretScanner   | 0.1.0   | Detect secrets in response bodies                 |
+| FindingReporter | 0.2.0   | Real-time output, session dedup, console/JSON/CSV |
 
 ## DB maintenance commands
   python -m proxy.core.store --db scan.db stats
   python -m proxy.core.store --db scan.db dedup
   python -m proxy.core.store --db scan.db vacuum --days 30
 
-## Traffic summary (post-dedup, see SCAN_STATUS.md for full details)
-- Endpoints: 1726 (302 CDN/analytics hidden in SCAN_STATUS.md)
+## Traffic summary (see SCAN_STATUS.md for full details)
+- Endpoints: 1726 (302 CDN/analytics hidden)
 - Findings:  653 unique
 
 ## Proxy start commands
@@ -97,25 +95,29 @@ tests/
 - SQLite VACUUM must run outside a transaction -- commit first, then
   set isolation_level=None, VACUUM, restore isolation_level=""
 - generator.py BRAIN_TEMPLATE needs manual update after major state changes
-  (traffic counts update automatically, module list/checklist do not)
+  (traffic counts + journal update automatically; module list/checklist do not)
+- Regex test values must match pattern length exactly -- GitHub ghp_ needs 36
+  chars after prefix, Google AIza needs 35 chars after prefix
 
 ## Last journal entries
-- 2026-06-07 13:18  [proxy]  stopped -- regenerating PROJECT_BRAIN.md
-- 2026-06-07 14:46  [proxy]  started on 0.0.0.0:8080
-- 2026-06-07 15:11  [proxy]  stopped -- regenerating PROJECT_BRAIN.md
 - 2026-06-08 07:25  [proxy]  started on 0.0.0.0:8080
 - 2026-06-08 11:33  [proxy]  stopped -- regenerating PROJECT_BRAIN.md
-- 2026-06-08 ~09:00 [feat]   session-009 store dedup + stats + CLI
-- 2026-06-08 ~09:30 [maint]  dedup run: 22070 -> 2559 records
 - 2026-06-10 11:47  [proxy]  started on 0.0.0.0:8080
 - 2026-06-10 11:48  [proxy]  stopped -- regenerating PROJECT_BRAIN.md
 - 2026-06-10 ~12:00 [feat]   session-010 GraphQLDetector v0.1.0 -- 146 tests
+- 2026-06-15 09:39  [proxy]  started on 0.0.0.0:8080
+- 2026-06-15 09:39  [proxy]  stopped -- regenerating PROJECT_BRAIN.md
+- 2026-06-15 ~10:00 [feat]   session-011 SecretScanner v0.1.0 + generator fix
+- 2026-06-15 ~10:30 [fix]    session-011b GitHub/Google regex test value lengths
+- 2026-06-15 ~10:30 [close]  174 passed 0 warnings -- session-011 closed
 
 ## Next session goal
-1. Fix generator.py BRAIN_TEMPLATE -- update to reflect sessions 007-010 state
-   so auto-generated brain docs are accurate going forward
-2. Response body secret scanning (proxy/modules/secret_scanner.py)
-   - Scan JSON response bodies for secrets: API keys, tokens, private keys
-   - Patterns: Bearer tokens, AWS keys, GitHub tokens, generic high-entropy strings
-   - Severity: high for known secret patterns, medium for high-entropy strings
-3. Consider: WebSocket detection (Phase 2 continuation)
+1. WebSocket detection (Phase 2 continuation)
+   - Detect WS/WSS upgrades (101 Switching Protocols)
+   - Log WebSocket endpoints as discoveries
+   - Flag unauthenticated WebSocket connections
+2. Review SecretScanner findings quality after live browsing session
+   - Check false positive rate on high-entropy detection
+   - Tune MIN_ENTROPY_LENGTH or HIGH_ENTROPY_THRESHOLD if needed
+3. Consider: PostgreSQL store migration prep (Phase 2)
+   - IStore abstraction already in place -- just needs AsyncpgStore implementation
